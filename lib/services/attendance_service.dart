@@ -76,14 +76,16 @@ class AttendanceService {
     required String userId,
     required String latitude,
     required String longitude,
+    String speed = '0',
+    String batteryPercentage = '0',
     String lang = 'en',
   }) {
     return trackLog(
       userId: userId,
       latitude: latitude,
       longitude: longitude,
-      speed: '0',
-      batteryPercentage: '0',
+      speed: speed,
+      batteryPercentage: batteryPercentage,
       lang: lang,
     );
   }

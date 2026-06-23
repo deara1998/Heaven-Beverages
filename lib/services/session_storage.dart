@@ -1,4 +1,5 @@
 import 'package:heaven_beverages/models/user_session.dart';
+import 'package:heaven_beverages/services/location_service.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class SessionStorage {
@@ -74,6 +75,7 @@ class SessionStorage {
     required DateTime punchInTime,
   }) async {
     final prefs = await SharedPreferences.getInstance();
+    await clearLastSync();
     await prefs.setBool(_punchedInKey, true);
     await prefs.setString(_punchInTimeKey, punchInTime.toIso8601String());
     await prefs.setString(_userIdKey, userId);
@@ -84,6 +86,34 @@ class SessionStorage {
     await prefs.remove(_punchedInKey);
     await prefs.remove(_punchInTimeKey);
     await prefs.remove(_userIdKey);
+    await clearLastSync();
+  }
+
+  Future<void> clearLastSync() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_lastSyncTimeKey);
+    await prefs.remove(_lastLatKey);
+    await prefs.remove(_lastLngKey);
+    await prefs.remove(_lastSpeedKey);
+    await prefs.remove(_lastBatteryKey);
+  }
+
+  Future<TrackLogDistanceResult> evaluateTrackLogAt(
+    double latitude,
+    double longitude,
+  ) async {
+    final last = await loadLastSync();
+    return LocationService.evaluateTrackLogDistance(
+      latitude: latitude,
+      longitude: longitude,
+      lastLatitude: last?.latitude,
+      lastLongitude: last?.longitude,
+    );
+  }
+
+  Future<bool> shouldSendTrackLogAt(double latitude, double longitude) async {
+    final result = await evaluateTrackLogAt(latitude, longitude);
+    return result.shouldSend;
   }
 
   Future<StoredAttendanceState?> loadPunchState(String userId) async {
@@ -105,6 +135,26 @@ class SessionStorage {
   Future<bool> isPunchedInForUser(String userId) async {
     final state = await loadPunchState(userId);
     return state != null;
+  }
+
+  /// Returns the user id currently punched in, if any.
+  Future<String?> loadActivePunchedInUserId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final isPunchedIn = prefs.getBool(_punchedInKey) ?? false;
+    if (!isPunchedIn) return null;
+    final userId = prefs.getString(_userIdKey);
+    if (userId == null || userId.isEmpty) return null;
+    return userId;
+  }
+
+  /// Prevents duplicate track_log calls when foreground and background overlap.
+  Future<bool> canSendTrackLog({
+    Duration minInterval = const Duration(seconds: 25),
+  }) async {
+    final last = await loadLastSync();
+    final lastTime = last?.syncTime;
+    if (lastTime == null) return true;
+    return DateTime.now().difference(lastTime) >= minInterval;
   }
 
   Future<void> saveLastSync({

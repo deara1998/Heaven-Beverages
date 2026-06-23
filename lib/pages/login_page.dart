@@ -4,6 +4,7 @@ import 'package:heaven_beverages/models/user_session.dart';
 import 'package:heaven_beverages/pages/dashboard_page.dart';
 import 'package:heaven_beverages/services/api_client.dart';
 import 'package:heaven_beverages/services/auth_service.dart';
+import 'package:heaven_beverages/services/session_manager.dart';
 import 'package:heaven_beverages/services/session_storage.dart';
 
 class LoginPage extends StatefulWidget {
@@ -18,6 +19,7 @@ class _LoginPageState extends State<LoginPage> {
   final _mobileController = TextEditingController();
   final _passwordController = TextEditingController();
   final _authService = AuthService();
+  final _sessionManager = SessionManager();
   final _sessionStorage = SessionStorage();
   bool _obscurePassword = true;
   bool _isLoading = false;
@@ -39,6 +41,7 @@ class _LoginPageState extends State<LoginPage> {
     _mobileController.dispose();
     _passwordController.dispose();
     _authService.dispose();
+    _sessionManager.dispose();
     super.dispose();
   }
 
@@ -47,8 +50,10 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> _openDashboard(UserSession session, LoginResult result) async {
-    await _sessionStorage.saveUserSession(
-      session,
+    await _sessionManager.saveLoginCredentials(
+      mobileNo: _mobileController.text.trim(),
+      password: _passwordController.text,
+      session: session,
       loginResponseRaw: result.raw,
     );
     if (!mounted) return;

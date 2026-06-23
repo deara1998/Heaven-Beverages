@@ -10,7 +10,10 @@ import 'package:heaven_beverages/services/api_client.dart';
 import 'package:heaven_beverages/services/attendance_service.dart';
 import 'package:heaven_beverages/services/background_tracking_service.dart';
 import 'package:heaven_beverages/services/location_service.dart';
+import 'package:heaven_beverages/services/session_manager.dart';
 import 'package:heaven_beverages/services/session_storage.dart';
+import 'package:heaven_beverages/services/tracking_constants.dart';
+import 'package:heaven_beverages/services/tracking_permissions.dart';
 import 'package:intl/intl.dart';
 
 class DashboardPage extends StatefulWidget {
@@ -26,6 +29,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   final _attendanceService = AttendanceService();
   final _locationService = LocationService();
   final _sessionStorage = SessionStorage();
+  final _sessionManager = SessionManager();
   final _timeFormat = DateFormat('hh:mm a');
   final _dateTimeFormat = DateFormat('dd MMM yyyy, hh:mm a');
 
@@ -34,13 +38,11 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   bool _isBusy = false;
   bool _isTracking = false;
   DateTime? _punchInTime;
-  DateTime? _lastSyncTime;
   LocationSnapshot? _currentLocation;
   final List<AttendanceLogEntry> _activityLog = [];
   StreamSubscription<Map<String, dynamic>?>? _syncSubscription;
+  StreamSubscription<Map<String, dynamic>?>? _locationSubscription;
   bool _isSendingTrackLog = false;
-
-  static const _trackInterval = Duration(seconds: 60);
 
   @override
   void initState() {
@@ -49,6 +51,8 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     if (!kIsWeb) {
       _syncSubscription =
           BackgroundTrackingService.syncUpdates().listen(_handleBackgroundSync);
+      _locationSubscription = BackgroundTrackingService.locationUpdates()
+          .listen(_handleLocationUpdate);
     }
     _restoreState();
     _loadLastSyncFromStorage();
@@ -57,8 +61,26 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _loadLastSyncFromStorage();
+    if (!_isPunchedIn) {
+      if (state == AppLifecycleState.resumed) {
+        _loadLastSyncFromStorage();
+      }
+      return;
+    }
+
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _loadLastSyncFromStorage();
+        if (!kIsWeb) {
+          unawaited(BackgroundTrackingService.wakeUp(widget.session.userId));
+        }
+      case AppLifecycleState.paused:
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        if (!kIsWeb) {
+          unawaited(BackgroundTrackingService.wakeUp(widget.session.userId));
+        }
     }
   }
 
@@ -66,9 +88,11 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _syncSubscription?.cancel();
+    _locationSubscription?.cancel();
     _mapController?.dispose();
     _locationService.dispose();
     _attendanceService.dispose();
+    _sessionManager.dispose();
     super.dispose();
   }
 
@@ -77,7 +101,6 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     if (!mounted || stored == null) return;
 
     setState(() {
-      _lastSyncTime = stored.syncTime;
       _currentLocation = LocationSnapshot(
         latitude: stored.latitude,
         longitude: stored.longitude,
@@ -85,7 +108,185 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         batteryPercentage: stored.batteryPercentage,
       );
     });
-    await _moveMapCamera(stored.latitude, stored.longitude);
+    await _updateMapView();
+  }
+
+  List<LatLng> _trackingRoutePoints() {
+    final points = <LatLng>[];
+    for (final entry in _activityLog.reversed) {
+      if (!_isValidMapPoint(entry.latitude, entry.longitude)) continue;
+      if (!_isLocationAction(entry.action)) continue;
+      if (!entry.success && entry.action == 'Track Log Failed') continue;
+      points.add(LatLng(entry.latitude, entry.longitude));
+    }
+    return _simplifyRoute(points);
+  }
+
+  List<LatLng> _simplifyRoute(List<LatLng> points) {
+    if (points.length <= 2) return points;
+
+    const minDelta = 0.00012;
+    final simplified = <LatLng>[points.first];
+    for (var i = 1; i < points.length; i++) {
+      final last = simplified.last;
+      final point = points[i];
+      final isLast = i == points.length - 1;
+      final moved = (point.latitude - last.latitude).abs() >= minDelta ||
+          (point.longitude - last.longitude).abs() >= minDelta;
+      if (moved || isLast) {
+        simplified.add(point);
+      }
+    }
+    return simplified;
+  }
+
+  bool _isValidMapPoint(double lat, double lng) {
+    return lat != 0 || lng != 0;
+  }
+
+  bool _isLocationAction(String action) {
+    return action == 'Track Log' ||
+        action == 'Punch In' ||
+        action == 'Punch Out';
+  }
+
+  Set<Marker> _buildMapMarkers() {
+    final markers = <Marker>{};
+
+    for (final entry in _activityLog) {
+      if (!_isValidMapPoint(entry.latitude, entry.longitude)) continue;
+
+      if (entry.action == 'Punch In') {
+        markers.add(
+          Marker(
+            markerId: const MarkerId('punch_in'),
+            position: LatLng(entry.latitude, entry.longitude),
+            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+            infoWindow: const InfoWindow(title: 'Punch In'),
+            zIndexInt: 2,
+          ),
+        );
+      } else if (entry.action == 'Punch Out') {
+        markers.add(
+          Marker(
+            markerId: const MarkerId('punch_out'),
+            position: LatLng(entry.latitude, entry.longitude),
+            icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueOrange),
+            infoWindow: const InfoWindow(title: 'Punch Out'),
+            zIndexInt: 2,
+          ),
+        );
+      }
+    }
+
+    return markers;
+  }
+
+  Set<Polyline> _buildMapPolylines() {
+    final route = _trackingRoutePoints();
+    if (route.length < 2) return {};
+
+    return {
+      Polyline(
+        polylineId: const PolylineId('tracking_route'),
+        points: route,
+        color: const Color(0xFF2E7D32),
+        width: 4,
+        geodesic: true,
+      ),
+    };
+  }
+
+  Future<void> _focusMapOn(double latitude, double longitude) async {
+    final controller = _mapController;
+    if (controller == null) return;
+    await controller.animateCamera(
+      CameraUpdate.newLatLngZoom(LatLng(latitude, longitude), 17),
+    );
+  }
+
+  Future<void> _updateMapView() async {
+    final controller = _mapController;
+    if (controller == null || kIsWeb) return;
+
+    final points = <LatLng>[];
+    final current = _currentLocation;
+    if (current != null && _isValidMapPoint(current.latitude, current.longitude)) {
+      points.add(LatLng(current.latitude, current.longitude));
+    }
+    points.addAll(_trackingRoutePoints());
+
+    if (points.isEmpty) return;
+
+    if (points.length == 1) {
+      await controller.animateCamera(
+        CameraUpdate.newLatLngZoom(points.first, 16),
+      );
+      return;
+    }
+
+    var minLat = points.first.latitude;
+    var maxLat = points.first.latitude;
+    var minLng = points.first.longitude;
+    var maxLng = points.first.longitude;
+
+    for (final point in points) {
+      minLat = minLat < point.latitude ? minLat : point.latitude;
+      maxLat = maxLat > point.latitude ? maxLat : point.latitude;
+      minLng = minLng < point.longitude ? minLng : point.longitude;
+      maxLng = maxLng > point.longitude ? maxLng : point.longitude;
+    }
+
+    if ((maxLat - minLat).abs() < 0.002) {
+      minLat -= 0.001;
+      maxLat += 0.001;
+    }
+    if ((maxLng - minLng).abs() < 0.002) {
+      minLng -= 0.001;
+      maxLng += 0.001;
+    }
+
+    final bounds = LatLngBounds(
+      southwest: LatLng(minLat, minLng),
+      northeast: LatLng(maxLat, maxLng),
+    );
+    await controller.animateCamera(CameraUpdate.newLatLngBounds(bounds, 72));
+  }
+
+  Future<LocationSnapshot> _withResolvedSpeed(LocationSnapshot snapshot) async {
+    final last = await _sessionStorage.loadLastSync();
+    final parsedKmh = double.tryParse(snapshot.speedKmh) ?? 0;
+    final speedKmh = LocationService.resolveSpeedKmh(
+      gpsSpeedMps: parsedKmh / 3.6,
+      latitude: snapshot.latitude,
+      longitude: snapshot.longitude,
+      lastLatitude: last?.latitude,
+      lastLongitude: last?.longitude,
+      lastSyncTime: last?.syncTime,
+    );
+    return LocationSnapshot(
+      latitude: snapshot.latitude,
+      longitude: snapshot.longitude,
+      speedKmh: speedKmh,
+      batteryPercentage: snapshot.batteryPercentage,
+    );
+  }
+
+  void _handleLocationUpdate(Map<String, dynamic>? event) {
+    if (!mounted || event == null) return;
+
+    final latitude = event['latitude'];
+    final longitude = event['longitude'];
+    if (latitude is! num || longitude is! num) return;
+
+    setState(() {
+      _currentLocation = LocationSnapshot(
+        latitude: latitude.toDouble(),
+        longitude: longitude.toDouble(),
+        speedKmh: event['speedKmh']?.toString() ?? '0',
+        batteryPercentage: event['batteryPercentage']?.toString() ?? '0',
+      );
+    });
   }
 
   void _handleBackgroundSync(Map<String, dynamic>? event) {
@@ -100,13 +301,9 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         speedKmh: event['speedKmh']?.toString() ?? '0',
         batteryPercentage: event['batteryPercentage']?.toString() ?? '0',
       );
-      final syncTimeRaw = event['syncTime']?.toString();
       setState(() {
         _currentLocation = snapshot;
-        _lastSyncTime =
-            syncTimeRaw == null ? DateTime.now() : DateTime.tryParse(syncTimeRaw);
       });
-      _moveMapCamera(snapshot.latitude, snapshot.longitude);
       _addLog(
         action: (event['success'] as bool? ?? false) ? 'Track Log' : 'Track Log Failed',
         snapshot: snapshot,
@@ -143,57 +340,132 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
   Future<void> _startTracking({bool callTrackLogNow = false}) async {
     if (kIsWeb) {
-      if (callTrackLogNow && _currentLocation != null) {
-        await _sendTrackLogFromForeground(_currentLocation!);
-      }
-      _locationService.startPeriodicTracking(
-        interval: _trackInterval,
-        onTick: _sendTrackLogFromForeground,
-        onError: (error) {
-          if (!mounted) return;
-          _addLog(
-            action: 'Track Log Failed',
-            snapshot: _currentLocation ??
-                const LocationSnapshot(
-                  latitude: 0,
-                  longitude: 0,
-                  speedKmh: '0',
-                  batteryPercentage: '0',
-                ),
-            message: error.toString(),
-            success: false,
-          );
-        },
-      );
+      _startForegroundTrackingLoop();
       return;
     }
-    await BackgroundTrackingService.start(
+    await _ensurePersistentTracking(requirePermissions: true);
+  }
+
+  Future<void> _ensurePersistentTracking({
+    bool requirePermissions = false,
+  }) async {
+    if (kIsWeb || !_isPunchedIn) return;
+
+    if (requirePermissions) {
+      final permissions = await TrackingPermissions.ensureForBackgroundTracking();
+      if (!permissions.granted) {
+        _showMessage(permissions.message, isError: true);
+        return;
+      }
+    } else if (!await TrackingPermissions.hasBackgroundTrackingPermissions()) {
+      debugPrint('[Tracking] Permissions missing — open app to fix');
+      return;
+    }
+
+    final started = await BackgroundTrackingService.ensureRunning(
       widget.session.userId,
-      callTrackLogNow: callTrackLogNow,
+    );
+    if (!started && requirePermissions) {
+      _showMessage(
+        'Could not start field tracking. Please restart the app.',
+        isError: true,
+      );
+    }
+  }
+
+  void _startForegroundTrackingLoop() {
+    _locationService.startPeriodicTracking(
+      interval: TrackingConstants.trackLogInterval,
+      onTick: _sendTrackLogFromForeground,
+      onError: _onForegroundTrackingError,
+    );
+    debugPrint('[Tracking] Web foreground loop started');
+  }
+
+  void _onForegroundTrackingError(Object error) {
+    if (!mounted) return;
+    debugPrint('[Tracking] Foreground tick failed: $error');
+    _addLog(
+      action: 'Track Log Failed',
+      snapshot: _currentLocation ??
+          const LocationSnapshot(
+            latitude: 0,
+            longitude: 0,
+            speedKmh: '0',
+            batteryPercentage: '0',
+          ),
+      message: error.toString(),
+      success: false,
     );
   }
 
-  Future<AttendanceResult> _callTrackLog(LocationSnapshot snapshot) {
-    return _attendanceService.trackLogLocation(
+  Future<void> _submitTrackLog(
+    LocationSnapshot snapshot, {
+    bool force = false,
+  }) async {
+    final resolved = await _withResolvedSpeed(snapshot);
+
+    if (!force) {
+      final distanceCheck = await _sessionStorage.evaluateTrackLogAt(
+        resolved.latitude,
+        resolved.longitude,
+      );
+      if (!distanceCheck.shouldSend) {
+        if (mounted) {
+          setState(() => _currentLocation = resolved);
+        }
+        return;
+      }
+    }
+
+    final batteryPercentage = await _locationService.readBatteryPercentage();
+    debugPrint(
+      '[Tracking] track_log lat=${resolved.latitude} lng=${resolved.longitude} '
+      'speed=${resolved.speedKmh}km/h battery=$batteryPercentage%',
+    );
+    final result = await _attendanceService.trackLogLocation(
       userId: widget.session.userId,
-      latitude: snapshot.latitude.toString(),
-      longitude: snapshot.longitude.toString(),
+      latitude: resolved.latitude.toString(),
+      longitude: resolved.longitude.toString(),
+      speed: resolved.speedKmh,
+      batteryPercentage: batteryPercentage,
+    );
+    await _recordTrackLog(
+      resolved,
+      result: result,
+      batteryPercentage: batteryPercentage,
     );
   }
 
   Future<void> _recordTrackLog(
     LocationSnapshot snapshot, {
     required AttendanceResult result,
+    String? batteryPercentage,
   }) async {
     if (!mounted) return;
+    final syncTime = DateTime.now();
+    final battery = batteryPercentage ?? snapshot.batteryPercentage;
+    final enrichedSnapshot = LocationSnapshot(
+      latitude: snapshot.latitude,
+      longitude: snapshot.longitude,
+      speedKmh: snapshot.speedKmh,
+      batteryPercentage: battery,
+    );
     setState(() {
-      _currentLocation = snapshot;
-      _lastSyncTime = DateTime.now();
+      _currentLocation = enrichedSnapshot;
     });
-    await _moveMapCamera(snapshot.latitude, snapshot.longitude);
+    if (result.isSuccess) {
+      await _sessionStorage.saveLastSync(
+        latitude: enrichedSnapshot.latitude,
+        longitude: enrichedSnapshot.longitude,
+        speedKmh: enrichedSnapshot.speedKmh,
+        batteryPercentage: battery,
+        syncTime: syncTime,
+      );
+    }
     _addLog(
       action: 'Track Log',
-      snapshot: snapshot,
+      snapshot: enrichedSnapshot,
       message: result.message ?? 'Location synced',
       success: result.isSuccess,
     );
@@ -207,13 +479,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   }
 
   Future<void> _sendTrackLogFromForeground(LocationSnapshot snapshot) async {
-    if (!_isPunchedIn || _isSendingTrackLog) return;
+    if (!_isPunchedIn || _isSendingTrackLog || !kIsWeb) return;
     _isSendingTrackLog = true;
 
     try {
-      final result = await _callTrackLog(snapshot);
-      await _recordTrackLog(snapshot, result: result);
+      await _submitTrackLog(snapshot);
     } catch (error) {
+      debugPrint('[Tracking] track_log failed: $error');
       if (!mounted) return;
       _addLog(
         action: 'Track Log Failed',
@@ -229,10 +501,15 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   Future<void> _refreshLocation({bool showLoader = true}) async {
     if (showLoader) setState(() => _isBusy = true);
     try {
-      final snapshot = await _locationService.getCurrentSnapshot();
+      final last = await _sessionStorage.loadLastSync();
+      final snapshot = await _locationService.getCurrentSnapshot(
+        lastLatitude: last?.latitude,
+        lastLongitude: last?.longitude,
+        lastSyncTime: last?.syncTime,
+      );
       if (!mounted) return;
       setState(() => _currentLocation = snapshot);
-      await _moveMapCamera(snapshot.latitude, snapshot.longitude);
+      await _updateMapView();
     } on LocationException catch (error) {
       _showMessage(error.message, isError: true);
     } catch (_) {
@@ -251,6 +528,11 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     setState(() => _isBusy = true);
 
     try {
+      final permissions = await TrackingPermissions.ensureForBackgroundTracking();
+      if (!permissions.granted) {
+        throw LocationException(permissions.message);
+      }
+
       final snapshot = await _locationService.getCurrentSnapshot();
       final result = await _attendanceService.punchIn(
         userId: widget.session.userId,
@@ -282,10 +564,11 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         message: result.message ?? 'Punched in successfully',
       );
 
-      final trackResult = await _callTrackLog(snapshot);
-      await _recordTrackLog(snapshot, result: trackResult);
+      await _submitTrackLog(snapshot, force: true);
 
-      await _moveMapCamera(snapshot.latitude, snapshot.longitude);
+      if (!kIsWeb) {
+        unawaited(BackgroundTrackingService.requestBatteryExemption());
+      }
       await _startTracking(callTrackLogNow: false);
       _showMessage(result.message ?? 'Punch in successful');
     } on AttendanceException catch (error) {
@@ -336,10 +619,6 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         message: result.message ?? 'Punched out successfully',
       );
 
-      final trackResult = await _callTrackLog(snapshot);
-      await _recordTrackLog(snapshot, result: trackResult);
-
-      await _moveMapCamera(snapshot.latitude, snapshot.longitude);
       _showMessage(result.message ?? 'Punch out successful');
     } on AttendanceException catch (error) {
       if (_isPunchedIn) await _startTracking();
@@ -382,21 +661,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     if (shouldLogout != true || !mounted) return;
 
     await _stopTracking();
-    await _sessionStorage.clearUserSession();
+    await _sessionManager.clearSession();
     await _sessionStorage.clearPunchIn();
 
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => const LoginPage()),
       (_) => false,
-    );
-  }
-
-  Future<void> _moveMapCamera(double latitude, double longitude) async {
-    final controller = _mapController;
-    if (controller == null) return;
-    await controller.animateCamera(
-      CameraUpdate.newLatLng(LatLng(latitude, longitude)),
     );
   }
 
@@ -422,6 +693,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         _activityLog.removeRange(20, _activityLog.length);
       }
     });
+    unawaited(_updateMapView());
   }
 
   void _showMessage(String message, {bool isError = false}) {
@@ -455,122 +727,86 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
     final location = _currentLocation;
 
     return Scaffold(
-      backgroundColor: colorScheme.surfaceContainerLowest,
-      appBar: AppBar(
-        title: const Text('Attendance Dashboard'),
-        actions: [
-          IconButton(
-            onPressed: _logout,
-            icon: const Icon(Icons.logout_rounded),
-            tooltip: 'Logout',
-          ),
-        ],
-      ),
+      backgroundColor: const Color(0xFFF4F6F8),
       body: RefreshIndicator(
         onRefresh: () => _refreshLocation(showLoader: false),
-        child: ListView(
+        child: CustomScrollView(
           physics: const AlwaysScrollableScrollPhysics(),
-          padding: const EdgeInsets.all(16),
-          children: [
-            _StatusCard(
-              name: widget.session.displayName,
-              mobileNo: widget.session.mobileNo,
-              isPunchedIn: _isPunchedIn,
-              punchInTime: _punchInTime,
-              isTracking: _isTracking,
-              lastSyncTime: _lastSyncTime,
-              timeFormat: _timeFormat,
-              dateTimeFormat: _dateTimeFormat,
-            ),
-            const SizedBox(height: 16),
-            _MapCard(
-              latitude: location?.latitude,
-              longitude: location?.longitude,
-              isTracking: _isTracking,
-              onMapCreated: (controller) => _mapController = controller,
-            ),
-            const SizedBox(height: 16),
-            _LocationInfoCard(
-              latitude: location?.latitude,
-              longitude: location?.longitude,
-              speedKmh: location?.speedKmh,
-              batteryPercentage: location?.batteryPercentage,
-              lastSyncTime: _lastSyncTime,
-              dateTimeFormat: _dateTimeFormat,
-              onRefresh: _isBusy ? null : () => _refreshLocation(),
-            ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _isBusy ? null : _handlePunchIn,
-                    icon: const Icon(Icons.login_rounded),
-                    label: const Text('Punch In'),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: _isPunchedIn
-                          ? Colors.green.shade400
-                          : Colors.green.shade700,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _isBusy ? null : _handlePunchOut,
-                    icon: const Icon(Icons.logout_rounded),
-                    label: const Text('Punch Out'),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: !_isPunchedIn
-                          ? Colors.orange.shade400
-                          : Colors.orange.shade800,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            if (_isBusy) ...[
-              const SizedBox(height: 16),
-              const Center(child: CircularProgressIndicator()),
-            ],
-            const SizedBox(height: 20),
-            Text(
-              'Activity Log',
-              style: theme.textTheme.titleMedium?.copyWith(
-                fontWeight: FontWeight.bold,
+          slivers: [
+            SliverToBoxAdapter(
+              child: _DashboardHeader(
+                onLogout: _logout,
+                isBusy: _isBusy,
               ),
             ),
-            const SizedBox(height: 8),
-            if (_activityLog.isEmpty)
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Text(
-                    _isPunchedIn
-                        ? 'Tracking will log your location every 20 seconds.'
-                        : 'Punch in to start attendance and live location tracking.',
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: colorScheme.onSurfaceVariant,
-                    ),
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+              sliver: SliverList(
+                delegate: SliverChildListDelegate([
+                  _EmployeeProfileCard(
+                    name: widget.session.displayName,
+                    mobileNo: widget.session.mobileNo,
+                    employeeId: widget.session.userId,
+                    isPunchedIn: _isPunchedIn,
+                    punchInTime: _punchInTime,
+                    isTracking: _isTracking,
+                    timeFormat: _timeFormat,
                   ),
-                ),
-              )
-            else
-              ..._activityLog.map(
-                (entry) => _ActivityTile(
-                  entry: entry,
-                  dateTimeFormat: _dateTimeFormat,
-                ),
+                  const SizedBox(height: 16),
+                  _PunchActionCard(
+                    isBusy: _isBusy,
+                    isPunchedIn: _isPunchedIn,
+                    onPunchIn: _handlePunchIn,
+                    onPunchOut: _handlePunchOut,
+                  ),
+                  if (_isBusy) ...[
+                    const SizedBox(height: 16),
+                    const Center(child: CircularProgressIndicator()),
+                  ],
+                  const SizedBox(height: 20),
+                  _MapCard(
+                    latitude: location?.latitude,
+                    longitude: location?.longitude,
+                    isTracking: _isTracking,
+                    markers: _buildMapMarkers(),
+                    polylines: _buildMapPolylines(),
+                    onMapCreated: (controller) {
+                      _mapController = controller;
+                      unawaited(_updateMapView());
+                    },
+                  ),
+                  const SizedBox(height: 14),
+                  _LocationStatsGrid(
+                    latitude: location?.latitude,
+                    longitude: location?.longitude,
+                    speedKmh: location?.speedKmh,
+                    batteryPercentage: location?.batteryPercentage,
+                    onRefresh: _isBusy ? null : () => _refreshLocation(),
+                  ),
+                  const SizedBox(height: 24),
+                  _SectionTitle(
+                    icon: Icons.history_rounded,
+                    title: 'Tracking Activity Log',
+                  ),
+                  const SizedBox(height: 10),
+                  if (_activityLog.isEmpty)
+                    _EmptyActivityCard(isPunchedIn: _isPunchedIn)
+                  else
+                    ..._activityLog.map(
+                      (entry) => _ActivityTile(
+                        entry: entry,
+                        dateTimeFormat: _dateTimeFormat,
+                        onTap: _isValidMapPoint(entry.latitude, entry.longitude)
+                            ? () => _focusMapOn(entry.latitude, entry.longitude)
+                            : null,
+                      ),
+                    ),
+                ]),
               ),
+            ),
           ],
         ),
       ),
@@ -578,50 +814,136 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   }
 }
 
-class _StatusCard extends StatelessWidget {
-  const _StatusCard({
-    required this.name,
-    required this.mobileNo,
-    required this.isPunchedIn,
-    required this.punchInTime,
-    required this.isTracking,
-    required this.lastSyncTime,
-    required this.timeFormat,
-    required this.dateTimeFormat,
+class _DashboardHeader extends StatelessWidget {
+  const _DashboardHeader({
+    required this.onLogout,
+    required this.isBusy,
   });
 
-  final String name;
-  final String mobileNo;
-  final bool isPunchedIn;
-  final DateTime? punchInTime;
-  final bool isTracking;
-  final DateTime? lastSyncTime;
-  final DateFormat timeFormat;
-  final DateFormat dateTimeFormat;
+  final VoidCallback onLogout;
+  final bool isBusy;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
-    final statusColor = isPunchedIn ? Colors.green.shade700 : Colors.grey.shade700;
+    final today = DateFormat('EEEE, dd MMM yyyy').format(DateTime.now());
 
-    return Card(
-      elevation: 0,
-      color: colorScheme.primaryContainer.withValues(alpha: 0.35),
-      child: Padding(
-        padding: const EdgeInsets.all(20),
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(20, 16, 12, 28),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF1B5E20), Color(0xFF2E7D32), Color(0xFF43A047)],
+        ),
+        borderRadius: BorderRadius.only(
+          bottomLeft: Radius.circular(28),
+          bottomRight: Radius.circular(28),
+        ),
+      ),
+      child: SafeArea(
+        bottom: false,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
               children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: const Icon(
+                    Icons.local_drink_rounded,
+                    color: Colors.white,
+                    size: 28,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Heaven Beverages',
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        'Field Attendance',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: Colors.white.withValues(alpha: 0.88),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: isBusy ? null : onLogout,
+                  icon: const Icon(Icons.logout_rounded, color: Colors.white),
+                  tooltip: 'Logout',
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Text(
+              today,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: Colors.white.withValues(alpha: 0.85),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _EmployeeProfileCard extends StatelessWidget {
+  const _EmployeeProfileCard({
+    required this.name,
+    required this.mobileNo,
+    required this.employeeId,
+    required this.isPunchedIn,
+    required this.punchInTime,
+    required this.isTracking,
+    required this.timeFormat,
+  });
+
+  final String name;
+  final String mobileNo;
+  final String employeeId;
+  final bool isPunchedIn;
+  final DateTime? punchInTime;
+  final bool isTracking;
+  final DateFormat timeFormat;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final statusColor = isPunchedIn ? const Color(0xFF2E7D32) : Colors.grey.shade600;
+
+    return Card(
+      elevation: 3,
+      shadowColor: Colors.black26,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          children: [
+            Row(
+              children: [
                 CircleAvatar(
-                  radius: 28,
-                  backgroundColor: colorScheme.primary,
+                  radius: 34,
+                  backgroundColor: const Color(0xFF2E7D32),
                   child: Text(
                     name.isNotEmpty ? name[0].toUpperCase() : '?',
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      color: colorScheme.onPrimary,
+                    style: theme.textTheme.headlineSmall?.copyWith(
+                      color: Colors.white,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
@@ -637,10 +959,23 @@ class _StatusCard extends StatelessWidget {
                           fontWeight: FontWeight.bold,
                         ),
                       ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.phone_android,
+                            size: 14,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(mobileNo, style: theme.textTheme.bodyMedium),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
                       Text(
-                        mobileNo,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: colorScheme.onSurfaceVariant,
+                        'ID: $employeeId',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
                         ),
                       ),
                     ],
@@ -654,37 +989,277 @@ class _StatusCard extends StatelessWidget {
                   ),
                   child: Text(
                     isPunchedIn ? 'ON DUTY' : 'OFF DUTY',
-                    style: theme.textTheme.labelMedium?.copyWith(
+                    style: theme.textTheme.labelSmall?.copyWith(
                       color: Colors.white,
                       fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
                     ),
                   ),
                 ),
               ],
             ),
-            const SizedBox(height: 16),
-            if (isPunchedIn && punchInTime != null)
-              Text('Punched in at ${timeFormat.format(punchInTime!)}'),
-            if (isTracking)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Row(
-                  children: [
+            if (isPunchedIn && punchInTime != null) ...[
+              const SizedBox(height: 16),
+              const Divider(height: 1),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Icon(Icons.schedule, size: 18, color: Colors.green.shade700),
+                  const SizedBox(width: 8),
+                  Text('Punched in at ${timeFormat.format(punchInTime!)}'),
+                  const Spacer(),
+                  if (isTracking)
                     Icon(Icons.gps_fixed, size: 18, color: Colors.green.shade700),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        lastSyncTime == null
-                            ? 'Live tracking active • every 20 sec'
-                            : 'Live tracking • last sync ${dateTimeFormat.format(lastSyncTime!)}',
-                        style: theme.textTheme.bodySmall,
-                      ),
-                    ),
-                  ],
-                ),
+                ],
               ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _PunchActionCard extends StatelessWidget {
+  const _PunchActionCard({
+    required this.isBusy,
+    required this.isPunchedIn,
+    required this.onPunchIn,
+    required this.onPunchOut,
+  });
+
+  final bool isBusy;
+  final bool isPunchedIn;
+  final VoidCallback onPunchIn;
+  final VoidCallback onPunchOut;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 0,
+      color: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: isBusy || isPunchedIn ? null : onPunchIn,
+                icon: const Icon(Icons.login_rounded),
+                label: const Text('Punch In'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF2E7D32),
+                  disabledBackgroundColor: Colors.green.shade200,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: isBusy || !isPunchedIn ? null : onPunchOut,
+                icon: const Icon(Icons.logout_rounded),
+                label: const Text('Punch Out'),
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFFE65100),
+                  disabledBackgroundColor: Colors.orange.shade200,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SectionTitle extends StatelessWidget {
+  const _SectionTitle({
+    required this.icon,
+    required this.title,
+  });
+
+  final IconData icon;
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      children: [
+        Icon(icon, color: const Color(0xFF2E7D32), size: 22),
+        const SizedBox(width: 8),
+        Text(
+          title,
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _EmptyActivityCard extends StatelessWidget {
+  const _EmptyActivityCard({required this.isPunchedIn});
+
+  final bool isPunchedIn;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Row(
+          children: [
+            Icon(
+              Icons.info_outline,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                isPunchedIn
+                    ? 'Tracking every 30 sec while on duty. Activity will appear here.'
+                    : 'Punch in to start field attendance and location tracking.',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _LocationStatsGrid extends StatelessWidget {
+  const _LocationStatsGrid({
+    required this.latitude,
+    required this.longitude,
+    required this.speedKmh,
+    required this.batteryPercentage,
+    required this.onRefresh,
+  });
+
+  final double? latitude;
+  final double? longitude;
+  final String? speedKmh;
+  final String? batteryPercentage;
+  final VoidCallback? onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _StatChip(
+                icon: Icons.speed,
+                label: 'Speed',
+                value: speedKmh == null ? '--' : '$speedKmh km/h',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _StatChip(
+                icon: Icons.battery_std_outlined,
+                label: 'Battery',
+                value: batteryPercentage == null ? '--' : '$batteryPercentage%',
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: _StatChip(
+                icon: Icons.my_location,
+                label: 'Latitude',
+                value: latitude?.toStringAsFixed(5) ?? '--',
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _StatChip(
+                icon: Icons.explore_outlined,
+                label: 'Longitude',
+                value: longitude?.toStringAsFixed(5) ?? '--',
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton.icon(
+            onPressed: onRefresh,
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            label: const Text('Refresh GPS'),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatChip extends StatelessWidget {
+  const _StatChip({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: const Color(0xFF2E7D32)),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(label, style: theme.textTheme.labelSmall),
+                Text(
+                  value,
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -695,12 +1270,16 @@ class _MapCard extends StatelessWidget {
     required this.latitude,
     required this.longitude,
     required this.isTracking,
+    required this.markers,
+    required this.polylines,
     required this.onMapCreated,
   });
 
   final double? latitude;
   final double? longitude;
   final bool isTracking;
+  final Set<Marker> markers;
+  final Set<Polyline> polylines;
   final ValueChanged<GoogleMapController> onMapCreated;
 
   @override
@@ -710,58 +1289,77 @@ class _MapCard extends StatelessWidget {
     final latLng = hasLocation ? LatLng(latitude!, longitude!) : null;
 
     return Card(
+      elevation: 2,
+      shadowColor: Colors.black12,
       clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Row(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Icon(Icons.map_outlined, color: theme.colorScheme.primary),
-                const SizedBox(width: 8),
-                Text(
-                  'Live Location',
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const Spacer(),
-                if (isTracking)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: Colors.green.shade50,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Text(
-                      'Tracking',
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        color: Colors.green.shade800,
-                        fontWeight: FontWeight.bold,
+                Row(
+                  children: [
+                    Icon(Icons.map_outlined, color: theme.colorScheme.primary, size: 20),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Live Map',
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
-                  ),
+                    if (isTracking)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: Colors.green.shade50,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: Colors.green.shade200),
+                        ),
+                        child: Text(
+                          'LIVE',
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: Colors.green.shade800,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 4,
+                  children: const [
+                    _MapLegendDot(color: Colors.blue, label: 'You'),
+                    _MapLegendDot(color: Color(0xFF2E7D32), label: 'Route'),
+                    _MapLegendDot(color: Colors.green, label: 'In'),
+                    _MapLegendDot(color: Colors.orange, label: 'Out'),
+                  ],
+                ),
               ],
             ),
           ),
           SizedBox(
-            height: 240,
+            height: 280,
             child: hasLocation && !kIsWeb
                 ? GoogleMap(
                     initialCameraPosition: CameraPosition(
                       target: latLng!,
                       zoom: 16,
                     ),
-                    markers: {
-                      Marker(
-                        markerId: const MarkerId('employee'),
-                        position: latLng,
-                      ),
-                    },
+                    markers: markers,
+                    polylines: polylines,
                     myLocationEnabled: true,
                     myLocationButtonEnabled: true,
                     zoomControlsEnabled: false,
+                    mapToolbarEnabled: false,
+                    padding: const EdgeInsets.only(top: 8, right: 48, bottom: 24),
                     onMapCreated: onMapCreated,
                   )
                 : Container(
@@ -806,101 +1404,28 @@ class _MapCard extends StatelessWidget {
   }
 }
 
-class _LocationInfoCard extends StatelessWidget {
-  const _LocationInfoCard({
-    required this.latitude,
-    required this.longitude,
-    required this.speedKmh,
-    required this.batteryPercentage,
-    required this.lastSyncTime,
-    required this.dateTimeFormat,
-    required this.onRefresh,
-  });
+class _MapLegendDot extends StatelessWidget {
+  const _MapLegendDot({required this.color, required this.label});
 
-  final double? latitude;
-  final double? longitude;
-  final String? speedKmh;
-  final String? batteryPercentage;
-  final DateTime? lastSyncTime;
-  final DateFormat dateTimeFormat;
-  final VoidCallback? onRefresh;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            _InfoRow(
-              icon: Icons.my_location,
-              label: 'Latitude',
-              value: latitude?.toStringAsFixed(6) ?? '--',
-            ),
-            _InfoRow(
-              icon: Icons.explore_outlined,
-              label: 'Longitude',
-              value: longitude?.toStringAsFixed(6) ?? '--',
-            ),
-            _InfoRow(
-              icon: Icons.speed,
-              label: 'Speed',
-              value: speedKmh == null ? '--' : '$speedKmh km/h',
-            ),
-            _InfoRow(
-              icon: Icons.battery_std_outlined,
-              label: 'Battery',
-              value: batteryPercentage == null ? '--' : '$batteryPercentage%',
-            ),
-            _InfoRow(
-              icon: Icons.sync,
-              label: 'Last API Sync',
-              value: lastSyncTime == null
-                  ? 'Not synced yet'
-                  : dateTimeFormat.format(lastSyncTime!),
-            ),
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton.icon(
-                onPressed: onRefresh,
-                icon: const Icon(Icons.refresh),
-                label: const Text('Refresh Location'),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  const _InfoRow({
-    required this.icon,
-    required this.label,
-    required this.value,
-  });
-
-  final IconData icon;
+  final Color color;
   final String label;
-  final String value;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        children: [
-          Icon(icon, size: 20),
-          const SizedBox(width: 12),
-          Expanded(child: Text(label)),
-          Text(
-            value,
-            style: const TextStyle(fontWeight: FontWeight.w600),
-          ),
-        ],
-      ),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          label,
+          style: Theme.of(context).textTheme.labelSmall?.copyWith(fontSize: 11),
+        ),
+      ],
     );
   }
 }
@@ -909,29 +1434,44 @@ class _ActivityTile extends StatelessWidget {
   const _ActivityTile({
     required this.entry,
     required this.dateTimeFormat,
+    this.onTap,
   });
 
   final AttendanceLogEntry entry;
   final DateFormat dateTimeFormat;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+        side: BorderSide(color: Colors.grey.shade200),
+      ),
       child: ListTile(
+        onTap: onTap,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
         leading: CircleAvatar(
           backgroundColor: entry.success
               ? colorScheme.primaryContainer
               : colorScheme.errorContainer,
           child: Icon(
-            entry.success ? Icons.check : Icons.error_outline,
+            entry.success ? Icons.check_rounded : Icons.error_outline_rounded,
             color: entry.success
                 ? colorScheme.onPrimaryContainer
                 : colorScheme.onErrorContainer,
           ),
         ),
-        title: Text(entry.action),
+        trailing: onTap == null
+            ? null
+            : Icon(Icons.map_outlined, color: colorScheme.primary, size: 20),
+        title: Text(
+          entry.action,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
         subtitle: Text(
           '${dateTimeFormat.format(entry.time)}\n'
           'Lat ${entry.latitude.toStringAsFixed(5)}, '
