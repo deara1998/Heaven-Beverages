@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:heaven_beverages/pages/dashboard_page.dart';
 import 'package:heaven_beverages/pages/login_page.dart';
+import 'package:heaven_beverages/services/app_startup.dart';
 import 'package:heaven_beverages/services/session_manager.dart';
+import 'package:heaven_beverages/theme/app_theme.dart';
 
 class SplashPage extends StatefulWidget {
   const SplashPage({super.key});
@@ -17,7 +21,7 @@ class _SplashPageState extends State<SplashPage> {
   @override
   void initState() {
     super.initState();
-    _bootstrap();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _bootstrap());
   }
 
   @override
@@ -27,46 +31,62 @@ class _SplashPageState extends State<SplashPage> {
   }
 
   Future<void> _bootstrap() async {
-    if (mounted) {
-      setState(() => _statusText = 'Refreshing session...');
-    }
+    try {
+      if (mounted) {
+        setState(() => _statusText = 'Starting app...');
+      }
 
-    final minimumSplash = Future.delayed(const Duration(milliseconds: 1800));
-    final loginFuture = _sessionManager.refreshSessionSilently();
+      final minimumSplash = Future.delayed(const Duration(milliseconds: 1200));
+      final loginFuture = _sessionManager.refreshSessionSilently();
 
-    final result = await loginFuture;
-    await minimumSplash;
+      if (mounted) {
+        setState(() => _statusText = 'Refreshing session...');
+      }
 
-    if (!mounted) return;
+      final result = await loginFuture;
+      await minimumSplash;
 
-    switch (result.status) {
-      case SilentLoginStatus.success:
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (_) => DashboardPage(session: result.session!),
-          ),
-        );
-      case SilentLoginStatus.noCredentials:
-      case SilentLoginStatus.failed:
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const LoginPage()),
-        );
+      if (!mounted) return;
+
+      switch (result.status) {
+        case SilentLoginStatus.success:
+          unawaited(AppStartup.resumeTrackingIfOnDuty());
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (_) => DashboardPage(session: result.session!),
+            ),
+          );
+        case SilentLoginStatus.noCredentials:
+        case SilentLoginStatus.failed:
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => const LoginPage()),
+          );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('[Splash] bootstrap failed: $error');
+      debugPrint('$stackTrace');
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const LoginPage()),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    const primary = Color(0xFF1B5E20);
-    const primaryLight = Color(0xFF2E7D32);
-
     return Scaffold(
       body: Container(
         width: double.infinity,
+        height: double.infinity,
         decoration: const BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: [primary, primaryLight, Color(0xFF43A047)],
+            colors: [
+              AppColors.primaryDark,
+              AppColors.primary,
+              AppColors.primaryLight,
+            ],
           ),
         ),
         child: SafeArea(
@@ -74,15 +94,20 @@ class _SplashPageState extends State<SplashPage> {
             children: [
               const Spacer(flex: 2),
               Container(
-                padding: const EdgeInsets.all(22),
+                padding: const EdgeInsets.all(18),
                 decoration: BoxDecoration(
                   color: Colors.white.withValues(alpha: 0.15),
                   shape: BoxShape.circle,
                 ),
-                child: const Icon(
-                  Icons.local_drink_rounded,
-                  size: 72,
-                  color: Colors.white,
+                child: Image.asset(
+                  'assets/ic_logo.png',
+                  width: 72,
+                  height: 72,
+                  errorBuilder: (_, __, ___) => const Icon(
+                    Icons.local_drink_rounded,
+                    size: 72,
+                    color: Colors.white,
+                  ),
                 ),
               ),
               const SizedBox(height: 28),

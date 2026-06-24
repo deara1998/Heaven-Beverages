@@ -10,4 +10,7 @@ class TrackingConstants {
 
   /// GPS speeds below this are treated as stationary (reduces false 2–4 km/h readings).
   static const stationarySpeedThresholdMps = 1.0;
+
+  /// GPS fixes older than this are discarded and re-fetched.
+  static const maxGpsAgeSeconds = 20;
 }

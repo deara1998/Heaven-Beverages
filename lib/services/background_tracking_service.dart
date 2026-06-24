@@ -7,7 +7,6 @@ import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:heaven_beverages/services/background_tracking_entry.dart';
 import 'package:heaven_beverages/services/session_storage.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 class BackgroundTrackingService {
   static const notificationChannelId = 'heaven_attendance_tracking';
@@ -18,33 +17,38 @@ class BackgroundTrackingService {
 
   static Future<void> initialize() async {
     if (Platform.isAndroid) {
-      await notifications.initialize(
-        const InitializationSettings(
-          android: AndroidInitializationSettings('ic_tracking_notification'),
-        ),
-      );
+      try {
+        await notifications.initialize(
+          const InitializationSettings(
+            android: AndroidInitializationSettings('ic_tracking_notification'),
+          ),
+        );
 
-      const androidChannel = AndroidNotificationChannel(
-        notificationChannelId,
-        'Field Attendance Tracking',
-        description: 'Silent channel for on-duty location tracking.',
-        importance: Importance.low,
-        playSound: false,
-        showBadge: false,
-      );
+        const androidChannel = AndroidNotificationChannel(
+          notificationChannelId,
+          'Field Attendance Tracking',
+          description: 'Silent channel for on-duty location tracking.',
+          importance: Importance.low,
+          playSound: false,
+          showBadge: false,
+        );
 
-      await notifications
-          .resolvePlatformSpecificImplementation<
-              AndroidFlutterLocalNotificationsPlugin>()
-          ?.createNotificationChannel(androidChannel);
+        await notifications
+            .resolvePlatformSpecificImplementation<
+                AndroidFlutterLocalNotificationsPlugin>()
+            ?.createNotificationChannel(androidChannel);
+      } catch (error) {
+        debugPrint('[Tracking] Notification init failed: $error');
+      }
     }
 
-    final service = FlutterBackgroundService();
-    await service.configure(
+    try {
+      final service = FlutterBackgroundService();
+      await service.configure(
       androidConfiguration: AndroidConfiguration(
         onStart: onBackgroundTrackingStart,
         autoStart: false,
-        autoStartOnBoot: true,
+        autoStartOnBoot: false,
         isForegroundMode: true,
         notificationChannelId: notificationChannelId,
         initialNotificationTitle: 'Heaven Beverages',
@@ -58,6 +62,10 @@ class BackgroundTrackingService {
         onBackground: _onIosBackground,
       ),
     );
+    } catch (error) {
+      debugPrint('[Tracking] Background service configure failed: $error');
+      rethrow;
+    }
   }
 
   static Future<void> resumeIfPunchedIn() async {
@@ -142,10 +150,9 @@ class BackgroundTrackingService {
   }
 
   static Future<void> requestBatteryExemption() async {
-    if (!Platform.isAndroid) return;
-    final status = await Permission.ignoreBatteryOptimizations.status;
-    if (status.isGranted) return;
-    await Permission.ignoreBatteryOptimizations.request();
+    // Not used — opening battery settings crashes on some OPPO/Realme devices.
+    // User can manually set Battery → Unrestricted in phone settings if needed.
+    debugPrint('[Tracking] Battery exemption skipped (enable manually in settings if needed)');
   }
 
   @pragma('vm:entry-point')

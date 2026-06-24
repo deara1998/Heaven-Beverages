@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:heaven_beverages/models/user_session.dart';
 import 'package:heaven_beverages/services/auth_service.dart';
@@ -44,6 +46,21 @@ class SessionManager {
 
   /// Calls login API silently and refreshes the stored session.
   Future<SilentLoginResult> refreshSessionSilently() async {
+    try {
+      return await _refreshSessionSilently().timeout(
+        const Duration(seconds: 20),
+        onTimeout: () {
+          debugPrint('[Session] Silent login timed out');
+          return const SilentLoginResult.failed('Connection timed out');
+        },
+      );
+    } catch (error) {
+      debugPrint('[Session] Silent login unexpected error: $error');
+      return SilentLoginResult.failed(error.toString());
+    }
+  }
+
+  Future<SilentLoginResult> _refreshSessionSilently() async {
     final credentials = await _credentialStorage.load();
     if (credentials == null) {
       return const SilentLoginResult.noCredentials();

@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:heaven_beverages/services/device_telemetry.dart';
 import 'package:heaven_beverages/services/tracking_constants.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 class LocationSnapshot {
   const LocationSnapshot({
@@ -43,8 +42,8 @@ class LocationService {
     double? lastLongitude,
     DateTime? lastSyncTime,
   }) async {
-    await ensureTrackingPermissions();
-    final position = await _getCurrentPosition();
+    await ensureForegroundLocationPermission();
+    final position = await getFreshPosition();
     return buildSnapshotFromPosition(
       position,
       lastLatitude: lastLatitude,
@@ -171,6 +170,44 @@ class LocationService {
     return (speedMetersPerSecond * 3.6).toStringAsFixed(1);
   }
 
+  /// Decimal places sent to server (~11 cm precision).
+  static const coordinateDecimalPlaces = 6;
+
+  static String formatCoordinate(double value) {
+    return value.toStringAsFixed(coordinateDecimalPlaces);
+  }
+
+  static String formatLatitude(double latitude) => formatCoordinate(latitude);
+
+  static String formatLongitude(double longitude) => formatCoordinate(longitude);
+
+  static String formatCoordinatePair(double latitude, double longitude) {
+    return '${formatLatitude(latitude)}, ${formatLongitude(longitude)}';
+  }
+
+  static bool hasValidCoordinates(double latitude, double longitude) {
+    if (latitude < -90 || latitude > 90) return false;
+    if (longitude < -180 || longitude > 180) return false;
+    if (latitude == 0 && longitude == 0) return false;
+    return true;
+  }
+
+  static void ensureValidCoordinates(double latitude, double longitude) {
+    if (!hasValidCoordinates(latitude, longitude)) {
+      throw LocationException(
+        'GPS location not ready. Please wait for accurate location and try again.',
+      );
+    }
+  }
+
+  static Map<String, String> coordinatesForApi(double latitude, double longitude) {
+    ensureValidCoordinates(latitude, longitude);
+    return {
+      'latitude': formatLatitude(latitude),
+      'longitude': formatLongitude(longitude),
+    };
+  }
+
   Future<String> readBatteryPercentage() => _telemetry.readBatteryPercentage();
 
   /// Starts a chained loop: fetch latest GPS, call [onTick], wait [interval],
@@ -200,7 +237,8 @@ class LocationService {
         final snapshot = await getCurrentSnapshot();
         if (session != _trackingSession) return;
         debugPrint(
-          '[Tracking] GPS ready lat=${snapshot.latitude} lng=${snapshot.longitude}',
+          '[Tracking] GPS ready lat=${LocationService.formatLatitude(snapshot.latitude)} '
+          'lng=${LocationService.formatLongitude(snapshot.longitude)}',
         );
         await onTick(snapshot);
       } catch (error) {
@@ -214,7 +252,7 @@ class LocationService {
     _trackingSession++;
   }
 
-  Future<void> ensureTrackingPermissions() async {
+  Future<void> ensureForegroundLocationPermission() async {
     if (kIsWeb) {
       final permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
@@ -240,30 +278,69 @@ class LocationService {
         'Location permission is permanently denied. Enable it in settings.',
       );
     }
-
-    if (!kIsWeb && Platform.isAndroid &&
-        permission == LocationPermission.whileInUse) {
-      final backgroundStatus = await Permission.locationAlways.status;
-      if (!backgroundStatus.isGranted) {
-        await Permission.locationAlways.request();
-      }
-    }
   }
 
-  Future<Position> _getCurrentPosition() async {
-    if (kIsWeb) {
-      final permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        await Geolocator.requestPermission();
-      }
+  @Deprecated('Use ensureForegroundLocationPermission')
+  Future<void> ensureTrackingPermissions() => ensureForegroundLocationPermission();
+
+  LocationSettings _locationSettings() {
+    if (!kIsWeb && Platform.isAndroid) {
+      return AndroidSettings(
+        accuracy: LocationAccuracy.best,
+        distanceFilter: 0,
+        timeLimit: const Duration(seconds: 30),
+      );
+    }
+    if (!kIsWeb && Platform.isIOS) {
+      return AppleSettings(
+        accuracy: LocationAccuracy.best,
+        timeLimit: const Duration(seconds: 30),
+      );
+    }
+    return const LocationSettings(
+      accuracy: LocationAccuracy.best,
+      timeLimit: Duration(seconds: 30),
+    );
+  }
+
+  bool _isStale(Position position) {
+    final age = DateTime.now().difference(position.timestamp);
+    return age.inSeconds > TrackingConstants.maxGpsAgeSeconds;
+  }
+
+  bool _isLowAccuracy(Position position) {
+    final accuracy = position.accuracy;
+    return accuracy.isFinite && accuracy > 50;
+  }
+
+  /// Fetches a fresh GPS fix; retries if cached or low-accuracy.
+  Future<Position> getFreshPosition() async {
+    final settings = _locationSettings();
+    var position = await Geolocator.getCurrentPosition(
+      locationSettings: settings,
+    );
+
+    if (_isStale(position) || _isLowAccuracy(position)) {
+      debugPrint(
+        '[GPS] Retrying — age=${DateTime.now().difference(position.timestamp).inSeconds}s '
+        'accuracy=${position.accuracy.toStringAsFixed(1)}m',
+      );
+      position = await Geolocator.getCurrentPosition(
+        locationSettings: settings,
+      );
     }
 
-    return Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.medium,
-        timeLimit: Duration(seconds: 15),
-      ),
+    ensureValidCoordinates(position.latitude, position.longitude);
+
+    final ageSeconds = DateTime.now().difference(position.timestamp).inSeconds;
+    debugPrint(
+      '[GPS] lat=${formatLatitude(position.latitude)} '
+      'lng=${formatLongitude(position.longitude)} '
+      'accuracy=${position.accuracy.toStringAsFixed(1)}m '
+      'age=${ageSeconds}s',
     );
+
+    return position;
   }
 
   void dispose() {

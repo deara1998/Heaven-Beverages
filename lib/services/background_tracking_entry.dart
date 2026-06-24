@@ -167,12 +167,7 @@ class _BackgroundTrackingRunner {
 
       final lastSent = await _sessionStorage.loadLastSync();
 
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.medium,
-          timeLimit: Duration(seconds: 20),
-        ),
-      );
+      final position = await _locationService.getFreshPosition();
 
       if (_activeUserId != userId) return;
 
@@ -204,16 +199,24 @@ class _BackgroundTrackingRunner {
         return;
       }
 
+      LocationService.ensureValidCoordinates(
+        trackSnapshot.latitude,
+        trackSnapshot.longitude,
+      );
+      final coords = LocationService.coordinatesForApi(
+        trackSnapshot.latitude,
+        trackSnapshot.longitude,
+      );
       debugPrint(
-        '[Tracking] Background track_log lat=${trackSnapshot.latitude} '
-        'lng=${trackSnapshot.longitude} speed=${trackSnapshot.speedKmh}km/h '
+        '[Tracking] Background track_log lat=${coords['latitude']} '
+        'lng=${coords['longitude']} speed=${trackSnapshot.speedKmh}km/h '
         'battery=$batteryPercentage%',
       );
 
       final result = await _attendanceService.trackLogLocation(
         userId: userId,
-        latitude: trackSnapshot.latitude.toString(),
-        longitude: trackSnapshot.longitude.toString(),
+        latitude: coords['latitude']!,
+        longitude: coords['longitude']!,
         speed: trackSnapshot.speedKmh,
         batteryPercentage: batteryPercentage,
       );

@@ -6,6 +6,7 @@ import 'package:heaven_beverages/services/api_client.dart';
 import 'package:heaven_beverages/services/auth_service.dart';
 import 'package:heaven_beverages/services/session_manager.dart';
 import 'package:heaven_beverages/services/session_storage.dart';
+import 'package:heaven_beverages/theme/app_theme.dart';
 
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -156,9 +157,9 @@ class _LoginPageState extends State<LoginPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final colorScheme = theme.colorScheme;
 
     return Scaffold(
+      backgroundColor: AppColors.scaffold,
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(
@@ -171,29 +172,53 @@ class _LoginPageState extends State<LoginPage> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Icon(
-                      Icons.local_drink_rounded,
-                      size: 72,
-                      color: colorScheme.primary,
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      'Heaven Beverages',
-                      textAlign: TextAlign.center,
-                      style: theme.textTheme.headlineMedium?.copyWith(
-                        fontWeight: FontWeight.bold,
-                        color: colorScheme.onSurface,
+                    Container(
+                      padding: const EdgeInsets.all(24),
+                      decoration: BoxDecoration(
+                        color: AppColors.primary,
+                        borderRadius: BorderRadius.circular(24),
+                      ),
+                      child: Column(
+                        children: [
+                          Image.asset(
+                            'assets/ic_logo.png',
+                            width: 64,
+                            height: 64,
+                            errorBuilder: (_, __, ___) => const Icon(
+                              Icons.local_drink_rounded,
+                              size: 64,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          Text(
+                            'Heaven Beverages',
+                            textAlign: TextAlign.center,
+                            style: theme.textTheme.titleLarge?.copyWith(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Field Attendance',
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: Colors.white.withValues(alpha: 0.85),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 28),
                     Text(
                       'Sign in to your account',
                       textAlign: TextAlign.center,
-                      style: theme.textTheme.bodyLarge?.copyWith(
-                        color: colorScheme.onSurfaceVariant,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.primary,
                       ),
                     ),
-                    const SizedBox(height: 40),
+                    const SizedBox(height: 24),
                     TextFormField(
                       controller: _mobileController,
                       keyboardType: TextInputType.phone,
@@ -253,13 +278,20 @@ class _LoginPageState extends State<LoginPage> {
                     FilledButton(
                       onPressed: _isLoading ? null : _handleLogin,
                       style: FilledButton.styleFrom(
+                        backgroundColor: AppColors.secondary,
                         padding: const EdgeInsets.symmetric(vertical: 16),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
                       ),
                       child: _isLoading
                           ? const SizedBox(
                               height: 20,
                               width: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
                             )
                           : const Text('Sign In'),
                     ),

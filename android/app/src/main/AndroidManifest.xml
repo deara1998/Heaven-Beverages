@@ -9,15 +9,18 @@
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
 
     <application
         android:label="Heaven Beverages"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:extractNativeLibs="true"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false">
         <meta-data
             android:name="com.google.android.geo.API_KEY"
-            android:value="YOUR_GOOGLE_MAPS_API_KEY"/>
+            android:value="AIzaSyBJfj26H8Lrz3i5D2ruSbJWORSw30cVKIE"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -43,7 +46,7 @@
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
             android:enabled="true"
-            android:exported="true"
+            android:exported="false"
             android:foregroundServiceType="location"
             android:stopWithTask="false"
             tools:replace="android:exported,android:foregroundServiceType,android:stopWithTask" />
@@ -51,7 +54,8 @@
         <receiver
             android:name="id.flutter.flutter_background_service.WatchdogReceiver"
             android:enabled="true"
-            android:exported="true" />
+            android:exported="false"
+            tools:replace="android:exported" />
 
         <receiver
             android:name="id.flutter.flutter_background_service.BootReceiver"
