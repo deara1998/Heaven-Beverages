@@ -71,24 +71,25 @@ class _BackgroundTrackingRunner {
     });
 
     service.invoke('serviceReady');
-
-    final userId = await _sessionStorage.loadActivePunchedInUserId();
-    if (userId != null) {
-      await _beginTracking(userId, callTrackLogNow: true);
-    }
   }
 
   /// Android requires a foreground service while tracking; set once, never update.
   Future<void> _ensureForegroundOnce() async {
     if (_foregroundActive || service is! AndroidServiceInstance) return;
 
-    final android = service as AndroidServiceInstance;
-    await android.setAsForegroundService();
-    await android.setForegroundNotificationInfo(
-      title: 'Heaven Beverages',
-      content: 'On duty',
-    );
-    _foregroundActive = true;
+    try {
+      final android = service as AndroidServiceInstance;
+      await android.setAsForegroundService();
+      await android.setForegroundNotificationInfo(
+        title: 'Heaven Beverages',
+        content: 'On duty',
+      );
+      _foregroundActive = true;
+    } catch (error, stackTrace) {
+      debugPrint('[Tracking] Foreground service start failed: $error');
+      debugPrint('$stackTrace');
+      rethrow;
+    }
   }
 
   Future<void> _beginTracking(
@@ -107,7 +108,12 @@ class _BackgroundTrackingRunner {
     final sessionId = _trackingSessionId;
     _activeUserId = userId;
 
-    await _ensureForegroundOnce();
+    try {
+      await _ensureForegroundOnce();
+    } catch (_) {
+      _activeUserId = null;
+      return;
+    }
     debugPrint('[Tracking] Background loop started for user $userId');
 
     unawaited(

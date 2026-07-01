@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:heaven_beverages/pages/dashboard_page.dart';
 import 'package:heaven_beverages/pages/login_page.dart';
-import 'package:heaven_beverages/services/app_startup.dart';
 import 'package:heaven_beverages/services/session_manager.dart';
 import 'package:heaven_beverages/theme/app_theme.dart';
 
@@ -50,7 +49,6 @@ class _SplashPageState extends State<SplashPage> {
 
       switch (result.status) {
         case SilentLoginStatus.success:
-          unawaited(AppStartup.resumeTrackingIfOnDuty());
           Navigator.of(context).pushReplacement(
             MaterialPageRoute(
               builder: (_) => DashboardPage(session: result.session!),

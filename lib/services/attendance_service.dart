@@ -283,6 +283,7 @@ class StaffDashboardResult {
     required this.raw,
     this.success,
     this.message,
+    this.todayStatus,
     this.isPunchedIn,
     this.punchInTime,
     this.data,
@@ -290,20 +291,24 @@ class StaffDashboardResult {
   });
 
   factory StaffDashboardResult.fromJson(Map<String, dynamic> json, String raw) {
-    final record = _extractRecord(json);
-    final punchInTime = _readDateTime(record, const [
-      'punch_in_time',
-      'PunchInTime',
-      'punch_in_date_time',
-      'PunchInDateTime',
-      'punchin_time',
-      'in_time',
-      'InTime',
-      'check_in_time',
-      'CheckInTime',
-      'start_time',
-      'StartTime',
+    final resultBlock = json['result'] ?? json['Result'];
+    final profile = _extractProfile(resultBlock);
+    final sessions = _extractSessions(resultBlock);
+
+    final sessionDuty = _resolveFromLastSession(sessions);
+    final todayStatus = _readString(profile, const [
+      'TodayStatus',
+      'today_status',
+      'todayStatus',
     ]);
+    final isPunchedIn = sessionDuty ?? _resolveFromProfile(profile, todayStatus);
+
+    final punchInTime = _readDateTime(profile, const [
+      'CurrentPunchInTime',
+      'current_punch_in_time',
+      'FirstPunchIn',
+      'first_punch_in',
+    ]) ?? _punchInTimeFromLastLiveSession(sessions);
 
     return StaffDashboardResult(
       raw: raw,
@@ -311,20 +316,27 @@ class StaffDashboardResult {
         json['success'] ?? json['Success'] ?? json['status'] ?? json['Status'],
       ),
       message: _readString(json, const ['message', 'Message', 'msg', 'Msg']),
-      isPunchedIn: _resolvePunchedIn(record, json),
+      todayStatus: todayStatus ?? _statusLabelFromDuty(isPunchedIn),
+      isPunchedIn: isPunchedIn,
       punchInTime: punchInTime,
       data: json,
-      record: record,
+      record: profile,
     );
   }
 
   final String raw;
   final bool? success;
   final String? message;
+  final String? todayStatus;
   final bool? isPunchedIn;
   final DateTime? punchInTime;
   final Map<String, dynamic>? data;
   final Map<String, dynamic>? record;
+
+  /// True when last session is Live / open (no punch out).
+  bool get isLive => isPunchedIn ?? todayStatus?.trim().toLowerCase() == 'live';
+
+  bool get isOnDuty => isLive;
 
   bool get isSuccess {
     if (success != null) return success!;
@@ -336,22 +348,115 @@ class StaffDashboardResult {
         lower.contains('"status":1');
   }
 
-  static Map<String, dynamic>? _extractRecord(Map<String, dynamic> json) {
-    final result = json['result'] ?? json['Result'] ?? json['data'] ?? json['Data'];
-    if (result is List && result.isNotEmpty) {
-      final first = result.first;
+  static Map<String, dynamic>? _extractProfile(dynamic resultBlock) {
+    if (resultBlock is! Map) return null;
+
+    final map = resultBlock is Map<String, dynamic>
+        ? resultBlock
+        : Map<String, dynamic>.from(resultBlock);
+
+    final profile = map['profile'] ?? map['Profile'];
+    if (profile is List && profile.isNotEmpty) {
+      final first = profile.first;
       if (first is Map<String, dynamic>) return first;
       if (first is Map) return Map<String, dynamic>.from(first);
     }
-    if (result is Map<String, dynamic>) return result;
-    if (result is Map) return Map<String, dynamic>.from(result);
-    return json;
+    if (profile is Map<String, dynamic>) return profile;
+    if (profile is Map) return Map<String, dynamic>.from(profile);
+
+    return map;
   }
 
-  static bool? _resolvePunchedIn(
-    Map<String, dynamic>? record,
-    Map<String, dynamic> json,
+  static List<Map<String, dynamic>> _extractSessions(dynamic resultBlock) {
+    if (resultBlock is! Map) return const [];
+
+    final map = resultBlock is Map<String, dynamic>
+        ? resultBlock
+        : Map<String, dynamic>.from(resultBlock);
+
+    final sessions = map['sessions'] ?? map['Sessions'];
+    if (sessions is! List) return const [];
+
+    return sessions
+        .whereType<Map>()
+        .map((session) => Map<String, dynamic>.from(session))
+        .toList();
+  }
+
+  /// Last session decides button: Live / no punch-out → Punch Out, else Punch In.
+  static bool? _resolveFromLastSession(List<Map<String, dynamic>> sessions) {
+    if (sessions.isEmpty) return null;
+
+    final last = sessions.last;
+    final sessionStatus =
+        _readString(last, const ['SessionStatus', 'session_status'])
+            ?.toLowerCase();
+
+    if (sessionStatus == 'live') return true;
+    if (sessionStatus == 'completed' ||
+        sessionStatus == 'closed' ||
+        sessionStatus == 'out') {
+      return false;
+    }
+
+    final punchOut = last['PunchOutTime'] ?? last['punch_out_time'];
+    if (punchOut == null) return true;
+    final punchOutText = punchOut.toString().trim();
+    if (punchOutText.isEmpty || punchOutText.toLowerCase() == 'null') {
+      return true;
+    }
+
+    return false;
+  }
+
+  static bool? _resolveFromProfile(
+    Map<String, dynamic>? profile,
+    String? todayStatus,
   ) {
+    if (todayStatus != null && todayStatus.trim().isNotEmpty) {
+      final normalized = todayStatus.trim().toLowerCase();
+      if (normalized == 'live') return true;
+      if (normalized == 'out' ||
+          normalized == 'off' ||
+          normalized == 'completed' ||
+          normalized == 'closed') {
+        return false;
+      }
+    }
+
+    if (profile == null) return null;
+
+    final profileStatus =
+        _readString(profile, const ['TodayStatus', 'today_status'])?.toLowerCase();
+    if (profileStatus == 'live') return true;
+    if (profileStatus == 'out' ||
+        profileStatus == 'completed' ||
+        profileStatus == 'closed') {
+      return false;
+    }
+
+    return _resolvePunchedInLegacy(profile);
+  }
+
+  static String? _statusLabelFromDuty(bool? isPunchedIn) {
+    if (isPunchedIn == null) return null;
+    return isPunchedIn ? 'Live' : 'Out';
+  }
+
+  static DateTime? _punchInTimeFromLastLiveSession(
+    List<Map<String, dynamic>> sessions,
+  ) {
+    if (sessions.isEmpty) return null;
+    final last = sessions.last;
+    if (_resolveFromLastSession([last]) == true) {
+      return _readDateTime(last, const ['PunchInTime', 'punch_in_time']);
+    }
+    return null;
+  }
+
+  static bool? _resolvePunchedInLegacy(Map<String, dynamic>? record) {
+    if (record == null) return null;
+
     final boolValue = _readBool(record, const [
       'is_punched_in',
       'isPunchedIn',
@@ -363,16 +468,6 @@ class StaffDashboardResult {
       'IsActive',
     ]);
     if (boolValue != null) return boolValue;
-
-    final boolFromRoot = _readBool(json, const [
-      'is_punched_in',
-      'isPunchedIn',
-      'punched_in',
-      'is_in',
-      'is_on_duty',
-      'on_duty',
-    ]);
-    if (boolFromRoot != null) return boolFromRoot;
 
     final status = _readString(record, const [
       'attendance_status',
@@ -395,6 +490,7 @@ class StaffDashboardResult {
           status == 'on duty' ||
           status == 'on_duty' ||
           status == 'active' ||
+          status == 'live' ||
           status == '1') {
         return true;
       }
@@ -405,6 +501,7 @@ class StaffDashboardResult {
           status == 'off duty' ||
           status == 'off_duty' ||
           status == 'inactive' ||
+          status == 'completed' ||
           status == '0') {
         return false;
       }
@@ -415,9 +512,15 @@ class StaffDashboardResult {
       'PunchOutTime',
       'out_time',
       'OutTime',
+      'LastPunchOut',
+      'last_punch_out',
     ]);
-    if (StaffDashboardResult.punchInTimeFrom(record) != null &&
-        (punchOutTime == null || punchOutTime.isEmpty)) {
+    final punchInTime = _readDateTime(record, const [
+      'CurrentPunchInTime',
+      'PunchInTime',
+      'FirstPunchIn',
+    ]);
+    if (punchInTime != null && (punchOutTime == null || punchOutTime.isEmpty)) {
       return true;
     }
     if (punchOutTime != null && punchOutTime.isNotEmpty) {
@@ -429,6 +532,8 @@ class StaffDashboardResult {
 
   static DateTime? punchInTimeFrom(Map<String, dynamic>? record) {
     return _readDateTime(record, const [
+      'CurrentPunchInTime',
+      'current_punch_in_time',
       'punch_in_time',
       'PunchInTime',
       'punch_in_date_time',
@@ -440,6 +545,8 @@ class StaffDashboardResult {
       'CheckInTime',
       'start_time',
       'StartTime',
+      'FirstPunchIn',
+      'first_punch_in',
     ]);
   }
 
@@ -487,8 +594,11 @@ class StaffDashboardResult {
     final raw = _readString(source, keys);
     if (raw == null) return null;
 
+    final msDate = _parseMsJsonDate(raw);
+    if (msDate != null) return msDate.toLocal();
+
     final direct = DateTime.tryParse(raw);
-    if (direct != null) return direct;
+    if (direct != null) return direct.toLocal();
 
     const patterns = [
       'yyyy-MM-dd HH:mm:ss',
@@ -511,5 +621,13 @@ class StaffDashboardResult {
     }
 
     return null;
+  }
+
+  static DateTime? _parseMsJsonDate(String raw) {
+    final match = RegExp(r'/Date\((-?\d+)\)/').firstMatch(raw);
+    if (match == null) return null;
+    final ms = int.tryParse(match.group(1)!);
+    if (ms == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
   }
 }

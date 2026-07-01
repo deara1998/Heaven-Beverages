@@ -7,6 +7,7 @@ import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:heaven_beverages/services/background_tracking_entry.dart';
 import 'package:heaven_beverages/services/session_storage.dart';
+import 'package:heaven_beverages/services/tracking_permissions.dart';
 
 class BackgroundTrackingService {
   static const notificationChannelId = 'heaven_attendance_tracking';
@@ -15,7 +16,11 @@ class BackgroundTrackingService {
   static final FlutterLocalNotificationsPlugin notifications =
       FlutterLocalNotificationsPlugin();
 
+  static var _configured = false;
+
   static Future<void> initialize() async {
+    if (_configured) return;
+
     if (Platform.isAndroid) {
       try {
         await notifications.initialize(
@@ -45,113 +50,174 @@ class BackgroundTrackingService {
     try {
       final service = FlutterBackgroundService();
       await service.configure(
-      androidConfiguration: AndroidConfiguration(
-        onStart: onBackgroundTrackingStart,
-        autoStart: false,
-        autoStartOnBoot: false,
-        isForegroundMode: true,
-        notificationChannelId: notificationChannelId,
-        initialNotificationTitle: 'Heaven Beverages',
-        initialNotificationContent: 'On duty',
-        foregroundServiceNotificationId: notificationId,
-        foregroundServiceTypes: [AndroidForegroundType.location],
-      ),
-      iosConfiguration: IosConfiguration(
-        autoStart: false,
-        onForeground: onBackgroundTrackingStart,
-        onBackground: _onIosBackground,
-      ),
-    );
-    } catch (error) {
+        androidConfiguration: AndroidConfiguration(
+          onStart: onBackgroundTrackingStart,
+          autoStart: false,
+          autoStartOnBoot: false,
+          isForegroundMode: true,
+          notificationChannelId: notificationChannelId,
+          initialNotificationTitle: 'Heaven Beverages',
+          initialNotificationContent: 'On duty',
+          foregroundServiceNotificationId: notificationId,
+          foregroundServiceTypes: [AndroidForegroundType.location],
+        ),
+        iosConfiguration: IosConfiguration(
+          autoStart: false,
+          onForeground: onBackgroundTrackingStart,
+          onBackground: _onIosBackground,
+        ),
+      );
+      _configured = true;
+    } catch (error, stackTrace) {
+      _configured = false;
       debugPrint('[Tracking] Background service configure failed: $error');
-      rethrow;
+      debugPrint('$stackTrace');
+    }
+  }
+
+  static Future<bool> _isRunningSafe() async {
+    if (!_configured) return false;
+    try {
+      return await FlutterBackgroundService().isRunning();
+    } catch (error) {
+      debugPrint('[Tracking] isRunning check failed: $error');
+      return false;
     }
   }
 
   static Future<void> resumeIfPunchedIn() async {
+    if (!await _canStartSafely()) return;
     final userId = await SessionStorage().loadActivePunchedInUserId();
     if (userId == null) return;
     await wakeUp(userId);
   }
 
+  static Future<bool> _canStartSafely() async {
+    try {
+      return await TrackingPermissions.canUseBackgroundService();
+    } catch (error) {
+      debugPrint('[Tracking] Permission check failed: $error');
+      return false;
+    }
+  }
+
   /// Keeps the background loop alive — no permission dialogs.
   static Future<void> wakeUp(String userId) async {
-    if (userId.isEmpty) return;
+    if (userId.isEmpty || !await _canStartSafely()) return;
     try {
+      await initialize();
+      if (!_configured) return;
+
       final service = FlutterBackgroundService();
-      if (await service.isRunning()) {
+      if (await _isRunningSafe()) {
         service.invoke('restartTracking', {'userId': userId});
         debugPrint('[Tracking] wakeUp → restartTracking for $userId');
         return;
       }
       await start(userId);
-    } catch (error) {
+    } catch (error, stackTrace) {
       debugPrint('[Tracking] wakeUp failed: $error');
+      debugPrint('$stackTrace');
     }
   }
 
   static Future<bool> ensureRunning(String userId) async {
+    if (!await _canStartSafely()) {
+      debugPrint('[Tracking] ensureRunning skipped — permissions not ready');
+      return false;
+    }
     try {
       await start(userId);
-      return true;
-    } catch (error) {
+      return await _isRunningSafe();
+    } catch (error, stackTrace) {
       debugPrint('[Tracking] ensureRunning failed: $error');
+      debugPrint('$stackTrace');
       return false;
     }
   }
 
   static Future<void> start(String userId, {bool callTrackLogNow = false}) async {
-    final service = FlutterBackgroundService();
-    final isRunning = await service.isRunning();
-
-    if (!isRunning) {
-      final ready = Completer<void>();
-      StreamSubscription<Map<String, dynamic>?>? readySub;
-      readySub = service.on('serviceReady').listen((_) {
-        readySub?.cancel();
-        if (!ready.isCompleted) ready.complete();
-      });
-
-      final started = await service.startService();
-      debugPrint('[Tracking] startService result: $started');
-
-      try {
-        await ready.future.timeout(const Duration(seconds: 8));
-      } catch (_) {
-        debugPrint('[Tracking] serviceReady timeout — isolate may still start');
-      } finally {
-        await readySub.cancel();
-      }
+    if (!await _canStartSafely()) {
+      debugPrint('[Tracking] start skipped — background permissions not ready');
+      return;
     }
 
-    service.invoke('startTracking', {
-      'userId': userId,
-      'callTrackLogNow': callTrackLogNow,
-    });
-    debugPrint('[Tracking] Background service active for $userId');
+    try {
+      await initialize();
+      if (!_configured) return;
+
+      final service = FlutterBackgroundService();
+      final isRunning = await _isRunningSafe();
+
+      if (!isRunning) {
+        final ready = Completer<void>();
+        StreamSubscription<Map<String, dynamic>?>? readySub;
+        readySub = service.on('serviceReady').listen((_) {
+          readySub?.cancel();
+          if (!ready.isCompleted) ready.complete();
+        });
+
+        final started = await service.startService();
+        debugPrint('[Tracking] startService result: $started');
+        if (started != true) return;
+
+        try {
+          await ready.future.timeout(const Duration(seconds: 8));
+        } catch (_) {
+          debugPrint('[Tracking] serviceReady timeout — isolate may still start');
+        } finally {
+          await readySub.cancel();
+        }
+      }
+
+      service.invoke('startTracking', {
+        'userId': userId,
+        'callTrackLogNow': callTrackLogNow,
+      });
+      debugPrint('[Tracking] Background service active for $userId');
+    } catch (error, stackTrace) {
+      debugPrint('[Tracking] start failed: $error');
+      debugPrint('$stackTrace');
+    }
   }
 
   static Future<void> stop() async {
-    final service = FlutterBackgroundService();
-    if (await service.isRunning()) {
+    if (!_configured) return;
+    try {
+      if (!await _isRunningSafe()) return;
+
+      final service = FlutterBackgroundService();
       service.invoke('stopTracking');
       await Future.delayed(const Duration(milliseconds: 300));
       service.invoke('stopService');
       debugPrint('[Tracking] Background service stopped');
+    } catch (error, stackTrace) {
+      debugPrint('[Tracking] stop failed: $error');
+      debugPrint('$stackTrace');
     }
   }
 
   static Stream<Map<String, dynamic>?> syncUpdates() {
-    return FlutterBackgroundService().on('syncUpdate');
+    if (!_configured) return const Stream.empty();
+    try {
+      return FlutterBackgroundService().on('syncUpdate');
+    } catch (error) {
+      debugPrint('[Tracking] syncUpdates stream failed: $error');
+      return const Stream.empty();
+    }
   }
 
   static Stream<Map<String, dynamic>?> locationUpdates() {
-    return FlutterBackgroundService().on('locationUpdate');
+    if (!_configured) return const Stream.empty();
+    try {
+      return FlutterBackgroundService().on('locationUpdate');
+    } catch (error) {
+      debugPrint('[Tracking] locationUpdates stream failed: $error');
+      return const Stream.empty();
+    }
   }
 
   static Future<void> requestBatteryExemption() async {
-    // Not used — opening battery settings crashes on some OPPO/Realme devices.
-    // User can manually set Battery → Unrestricted in phone settings if needed.
     debugPrint('[Tracking] Battery exemption skipped (enable manually in settings if needed)');
   }
 

@@ -19,15 +19,53 @@ class TrackingPermissions {
 
   /// Silent check — never shows permission dialogs (safe when app is in background).
   static Future<bool> hasBackgroundTrackingPermissions() async {
+    return canUseBackgroundService();
+  }
+
+  /// True when GPS works while the app is on screen (While using / Always).
+  static Future<bool> hasForegroundLocation() async {
     if (kIsWeb) return true;
     if (!Platform.isAndroid && !Platform.isIOS) return true;
+
+    final permission = await Geolocator.checkPermission();
+    return permission == LocationPermission.whileInUse ||
+        permission == LocationPermission.always;
+  }
+
+  /// Background foreground-service requires "Allow all the time" + notifications.
+  static Future<bool> canUseBackgroundService() async {
+    if (kIsWeb) return false;
+    if (!Platform.isAndroid && !Platform.isIOS) return false;
 
     if (Platform.isAndroid) {
       final location = await Geolocator.checkPermission();
       if (location != LocationPermission.always) return false;
+      if (!await hasNotificationPermission()) return false;
     }
 
     return true;
+  }
+
+  static Future<bool> hasNotificationPermission() async {
+    if (kIsWeb || !Platform.isAndroid) return true;
+    try {
+      final status = await Permission.notification.status;
+      return status.isGranted;
+    } catch (error) {
+      debugPrint('[Permissions] Notification check failed: $error');
+      return false;
+    }
+  }
+
+  /// Ask notification permission (Android 13+) — does not block punch in.
+  static Future<void> requestNotificationIfNeeded() async {
+    if (kIsWeb || !Platform.isAndroid) return;
+    try {
+      if (await hasNotificationPermission()) return;
+      await Permission.notification.request();
+    } catch (error) {
+      debugPrint('[Permissions] Notification request failed: $error');
+    }
   }
 
   /// Runtime GPS permission — ask "While using the app" first.
@@ -139,23 +177,21 @@ class TrackingPermissions {
     }
   }
 
-  /// Full flow for punch in: foreground GPS → then background (all the time).
+  /// Full flow for punch in: foreground GPS first; background is optional.
   static Future<TrackingPermissionResult> ensureForBackgroundTracking() async {
-    if (kIsWeb) {
+    return requestForegroundLocation();
+  }
+
+  /// Optional — ask for "Allow all the time" without blocking punch in.
+  static Future<TrackingPermissionResult> requestBackgroundIfNeeded() async {
+    if (kIsWeb || !Platform.isAndroid) {
       return const TrackingPermissionResult(granted: true, message: 'ok');
     }
 
-    if (!Platform.isAndroid && !Platform.isIOS) {
+    if (await canUseBackgroundService()) {
       return const TrackingPermissionResult(granted: true, message: 'ok');
     }
 
-    final foreground = await requestForegroundLocation();
-    if (!foreground.granted) return foreground;
-
-    if (Platform.isAndroid) {
-      return requestBackgroundLocationSafe();
-    }
-
-    return const TrackingPermissionResult(granted: true, message: 'ok');
+    return requestBackgroundLocationSafe();
   }
 }

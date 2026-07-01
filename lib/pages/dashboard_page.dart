@@ -36,41 +36,54 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   bool _isPunchedIn = false;
   bool _isBusy = false;
   bool _isLoadingDashboard = true;
+  String? _todayStatus;
   DateTime? _punchInTime;
   LocationSnapshot? _currentLocation;
   final List<AttendanceLogEntry> _activityLog = [];
   StreamSubscription<Map<String, dynamic>?>? _syncSubscription;
   StreamSubscription<Map<String, dynamic>?>? _locationSubscription;
   bool _isSendingTrackLog = false;
+  bool _foregroundTrackingActive = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    if (!kIsWeb) {
-      _syncSubscription =
-          BackgroundTrackingService.syncUpdates().listen(_handleBackgroundSync);
-      _locationSubscription = BackgroundTrackingService.locationUpdates()
-          .listen(_handleLocationUpdate);
-    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_safeStartup());
     });
   }
 
+  Future<void> _attachBackgroundListeners() async {
+    if (kIsWeb) return;
+    try {
+      _syncSubscription =
+          BackgroundTrackingService.syncUpdates().listen(_handleBackgroundSync);
+      _locationSubscription = BackgroundTrackingService.locationUpdates()
+          .listen(_handleLocationUpdate);
+    } catch (error, stackTrace) {
+      debugPrint('[Dashboard] Background listeners failed: $error');
+      debugPrint('$stackTrace');
+    }
+  }
+
   Future<void> _safeStartup() async {
     try {
-      if (!kIsWeb) {
-        final permission = await TrackingPermissions.requestForegroundLocation();
-        if (!permission.granted && mounted) {
-          _showMessage(permission.message, isError: true);
-        }
-      }
       await _loadStaffDashboard();
-      if (_isPunchedIn && !kIsWeb) {
-        unawaited(AppStartup.resumeTrackingIfOnDuty());
+
+      if (_isPunchedIn) {
+        _scheduleForegroundTracking();
       }
-      await _refreshLocation(showLoader: false);
+
+      if (await TrackingPermissions.hasForegroundLocation()) {
+        await _refreshLocation(showLoader: false);
+      }
+
+      if (!kIsWeb &&
+          _isPunchedIn &&
+          await TrackingPermissions.canUseBackgroundService()) {
+        await _attachBackgroundListeners();
+      }
     } catch (error, stackTrace) {
       debugPrint('[Dashboard] startup failed: $error');
       debugPrint('$stackTrace');
@@ -79,6 +92,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         setState(() => _isLoadingDashboard = false);
       }
     }
+  }
+
+  void _scheduleForegroundTracking() {
+    Future<void>.delayed(const Duration(seconds: 2), () {
+      if (!mounted || !_isPunchedIn) return;
+      unawaited(_startTracking(preferBackground: false));
+    });
   }
 
   String _todayTripDate() => DateFormat('yyyy-MM-dd').format(DateTime.now());
@@ -102,15 +122,19 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         return;
       }
 
-      final isPunchedIn = dashboard.isPunchedIn;
-      if (isPunchedIn == null) {
-        debugPrint('[Dashboard] staff_dashboard missing punch status, using local state');
+      final isOnDuty = dashboard.isOnDuty;
+
+      if (dashboard.isPunchedIn == null) {
+        debugPrint('[Dashboard] staff_dashboard missing status, using local state');
         await _restoreStateFromLocal();
         return;
       }
 
+      if (!mounted) return;
+      setState(() => _todayStatus = dashboard.todayStatus);
+
       await _applyAttendanceState(
-        isPunchedIn: isPunchedIn,
+        isPunchedIn: isOnDuty,
         punchInTime: dashboard.punchInTime,
       );
     } on AttendanceException catch (error) {
@@ -141,8 +165,8 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     setState(() {
       _isPunchedIn = true;
       _punchInTime = stored.punchInTime;
+      _todayStatus = 'Live';
     });
-    await _startTracking();
   }
 
   Future<void> _applyAttendanceState({
@@ -162,8 +186,8 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       setState(() {
         _isPunchedIn = true;
         _punchInTime = resolvedPunchInTime;
+        _todayStatus = 'Live';
       });
-      await _startTracking();
       return;
     }
 
@@ -174,33 +198,40 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     setState(() {
       _isPunchedIn = false;
       _punchInTime = null;
+      _todayStatus = 'Out';
     });
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    unawaited(_handleLifecycleChange(state));
+  }
+
+  Future<void> _handleLifecycleChange(AppLifecycleState state) async {
     if (!_isPunchedIn) {
       if (state == AppLifecycleState.resumed) {
-        unawaited(_loadStaffDashboard());
-        unawaited(_refreshLocation(showLoader: false));
+        await _loadStaffDashboard();
+        if (await TrackingPermissions.hasForegroundLocation()) {
+          await _refreshLocation(showLoader: false);
+        }
       }
       return;
     }
 
     switch (state) {
       case AppLifecycleState.resumed:
-        unawaited(_loadStaffDashboard());
-        unawaited(_refreshLocation(showLoader: false));
-        if (!kIsWeb) {
-          unawaited(BackgroundTrackingService.wakeUp(widget.session.userId));
+        await _loadStaffDashboard();
+        if (await TrackingPermissions.hasForegroundLocation()) {
+          await _refreshLocation(showLoader: false);
+        }
+        if (!kIsWeb && _isPunchedIn) {
+          _scheduleForegroundTracking();
         }
       case AppLifecycleState.paused:
       case AppLifecycleState.inactive:
       case AppLifecycleState.hidden:
       case AppLifecycleState.detached:
-        if (!kIsWeb) {
-          unawaited(BackgroundTrackingService.wakeUp(widget.session.userId));
-        }
+        break;
     }
   }
 
@@ -293,50 +324,64 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     await _refreshLocation(showLoader: false);
   }
 
-  Future<void> _startTracking({bool callTrackLogNow = false}) async {
-    if (kIsWeb) {
-      _startForegroundTrackingLoop();
-      return;
-    }
-    await _ensurePersistentTracking(requirePermissions: true);
-  }
+  Future<void> _startTracking({bool preferBackground = false}) async {
+    if (!_isPunchedIn) return;
 
-  Future<void> _ensurePersistentTracking({
-    bool requirePermissions = false,
-  }) async {
-    if (kIsWeb || !_isPunchedIn) return;
+    try {
+      final canUseBackground = !kIsWeb &&
+          preferBackground &&
+          await TrackingPermissions.canUseBackgroundService();
 
-    if (requirePermissions) {
-      final permissions = await TrackingPermissions.ensureForBackgroundTracking();
-      if (!permissions.granted) {
-        _showMessage(permissions.message, isError: true);
+      if (canUseBackground) {
+        _locationService.stopPeriodicTracking();
+        _foregroundTrackingActive = false;
+        await _ensurePersistentTracking();
         return;
       }
-    } else if (!await TrackingPermissions.hasBackgroundTrackingPermissions()) {
-      debugPrint('[Tracking] Permissions missing — open app to fix');
+
+      if (!kIsWeb) {
+        await BackgroundTrackingService.stop();
+      }
+      _startForegroundTrackingLoop();
+    } catch (error, stackTrace) {
+      debugPrint('[Tracking] _startTracking failed: $error');
+      debugPrint('$stackTrace');
+    }
+  }
+
+  Future<void> _ensurePersistentTracking() async {
+    if (kIsWeb || !_isPunchedIn) return;
+    if (!await TrackingPermissions.canUseBackgroundService()) {
+      debugPrint('[Tracking] Background service skipped — need "Allow all the time"');
       return;
     }
 
-    await AppStartup.ensureBackgroundTrackingReady();
+    try {
+      await AppStartup.ensureBackgroundTrackingReady();
 
-    final started = await BackgroundTrackingService.ensureRunning(
-      widget.session.userId,
-    );
-    if (!started && requirePermissions) {
-      _showMessage(
-        'Could not start field tracking. Please restart the app.',
-        isError: true,
+      final started = await BackgroundTrackingService.ensureRunning(
+        widget.session.userId,
       );
+      if (!started) {
+        debugPrint('[Tracking] Background service not started — using foreground loop');
+        _startForegroundTrackingLoop();
+      }
+    } catch (error, stackTrace) {
+      debugPrint('[Tracking] ensurePersistentTracking failed: $error');
+      debugPrint('$stackTrace');
+      _startForegroundTrackingLoop();
     }
   }
 
   void _startForegroundTrackingLoop() {
+    if (_foregroundTrackingActive) return;
+    _foregroundTrackingActive = true;
     _locationService.startPeriodicTracking(
       interval: TrackingConstants.trackLogInterval,
       onTick: _sendTrackLogFromForeground,
       onError: _onForegroundTrackingError,
     );
-    debugPrint('[Tracking] Web foreground loop started');
+    debugPrint('[Tracking] Foreground loop started');
   }
 
   void _onForegroundTrackingError(Object error) {
@@ -435,13 +480,14 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
   Future<void> _stopTracking() async {
     _locationService.stopPeriodicTracking();
+    _foregroundTrackingActive = false;
     if (!kIsWeb) {
       await BackgroundTrackingService.stop();
     }
   }
 
   Future<void> _sendTrackLogFromForeground(LocationSnapshot snapshot) async {
-    if (!_isPunchedIn || _isSendingTrackLog || !kIsWeb) return;
+    if (!_isPunchedIn || _isSendingTrackLog) return;
     _isSendingTrackLog = true;
 
     try {
@@ -482,7 +528,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
   Future<void> _handlePunchIn() async {
     if (_isBusy) return;
-    if (_isPunchedIn) {
+    if (_isLiveForUi()) {
       _showMessage('You are already ON DUTY. Use Punch Out to end your shift.');
       return;
     }
@@ -492,6 +538,12 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       final permissions = await TrackingPermissions.ensureForBackgroundTracking();
       if (!permissions.granted) {
         throw LocationException(permissions.message);
+      }
+
+      // Optional — do not block punch in if user chose "While using the app".
+      if (!kIsWeb) {
+        unawaited(TrackingPermissions.requestBackgroundIfNeeded());
+        unawaited(TrackingPermissions.requestNotificationIfNeeded());
       }
 
       final snapshot = await _locationService.getCurrentSnapshot();
@@ -519,6 +571,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       setState(() {
         _isPunchedIn = true;
         _punchInTime = punchInTime;
+        _todayStatus = 'Live';
         _currentLocation = snapshot;
       });
 
@@ -530,9 +583,17 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
       await _submitTrackLog(snapshot, force: true);
 
-      await _startTracking(callTrackLogNow: false);
+      await _startTracking(preferBackground: false);
       unawaited(_loadStaffDashboard());
-      _showMessage(result.message ?? 'Punch in successful');
+
+      if (!kIsWeb && !await TrackingPermissions.canUseBackgroundService()) {
+        _showMessage(
+          'Punch in successful. Tracking works while the app is open. '
+          'For background tracking, set Location to "Allow all the time" in settings.',
+        );
+      } else {
+        _showMessage(result.message ?? 'Punch in successful');
+      }
     } on AttendanceException catch (error) {
       _showMessage(error.message, isError: true);
     } on LocationException catch (error) {
@@ -546,7 +607,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
   Future<void> _handlePunchOut() async {
     if (_isBusy) return;
-    if (!_isPunchedIn) {
+    if (!_isLiveForUi()) {
       _showMessage('You are OFF DUTY. Use Punch In to start your shift.');
       return;
     }
@@ -575,6 +636,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       setState(() {
         _isPunchedIn = false;
         _punchInTime = null;
+        _todayStatus = 'Out';
         _currentLocation = snapshot;
       });
 
@@ -587,13 +649,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       unawaited(_loadStaffDashboard());
       _showMessage(result.message ?? 'Punch out successful');
     } on AttendanceException catch (error) {
-      if (_isPunchedIn) await _startTracking();
+      if (_isPunchedIn) await _startTracking(preferBackground: false);
       _showMessage(error.message, isError: true);
     } on LocationException catch (error) {
-      if (_isPunchedIn) await _startTracking();
+      if (_isPunchedIn) await _startTracking(preferBackground: false);
       _showMessage(error.message, isError: true);
     } catch (error) {
-      if (_isPunchedIn) await _startTracking();
+      if (_isPunchedIn) await _startTracking(preferBackground: false);
       _showMessage(_connectionErrorMessage(error), isError: true);
     } finally {
       if (mounted) setState(() => _isBusy = false);
@@ -701,6 +763,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     return 'Punched in on ${DateFormat('dd MMM, yyyy • hh:mm a').format(_punchInTime!)}';
   }
 
+  bool _isLiveForUi() {
+    if (_todayStatus != null && _todayStatus!.trim().isNotEmpty) {
+      return _todayStatus!.trim().toLowerCase() == 'live';
+    }
+    return _isPunchedIn;
+  }
+
   int _successfulTrackCount() =>
       _activityLog.where((e) => e.action == 'Track Log' && e.success).length;
 
@@ -730,7 +799,8 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
                 child: _WorkingTimeCard(
-                  isPunchedIn: _isPunchedIn,
+                  todayStatus: _todayStatus,
+                  isLive: _isLiveForUi(),
                   isBusy: _isBusy || _isLoadingDashboard,
                   clockDisplay: _clockDisplay(),
                   punchInDateLabel: _punchInDateLabel(),
@@ -895,7 +965,8 @@ class _AttendanceHeader extends StatelessWidget {
 
 class _WorkingTimeCard extends StatelessWidget {
   const _WorkingTimeCard({
-    required this.isPunchedIn,
+    required this.todayStatus,
+    required this.isLive,
     required this.isBusy,
     required this.clockDisplay,
     required this.punchInDateLabel,
@@ -903,7 +974,8 @@ class _WorkingTimeCard extends StatelessWidget {
     required this.onPunchOut,
   });
 
-  final bool isPunchedIn;
+  final String? todayStatus;
+  final bool isLive;
   final bool isBusy;
   final String clockDisplay;
   final String? punchInDateLabel;
@@ -914,6 +986,9 @@ class _WorkingTimeCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final parts = clockDisplay.split(' : ');
+    final statusLabel = todayStatus?.trim().isNotEmpty == true
+        ? todayStatus!.trim()
+        : (isLive ? 'Live' : 'Out');
 
     return Container(
       decoration: BoxDecoration(
@@ -932,11 +1007,32 @@ class _WorkingTimeCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            isPunchedIn ? 'Punch In Time' : 'Ready to Start',
+            "Today's Status",
             style: theme.textTheme.bodyMedium?.copyWith(
               color: AppColors.textMuted,
               fontWeight: FontWeight.w500,
             ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  color: isLive ? const Color(0xFF22C55E) : AppColors.textMuted,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                statusLabel,
+                style: theme.textTheme.titleMedium?.copyWith(
+                  color: AppColors.primary,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 14),
           Row(
@@ -999,13 +1095,9 @@ class _WorkingTimeCard extends StatelessWidget {
           SizedBox(
             width: double.infinity,
             child: FilledButton.icon(
-              onPressed: isBusy
-                  ? null
-                  : (isPunchedIn ? onPunchOut : onPunchIn),
-              icon: Icon(
-                isPunchedIn ? Icons.logout_rounded : Icons.login_rounded,
-              ),
-              label: Text(isPunchedIn ? 'Punch Out' : 'Punch In'),
+              onPressed: isBusy ? null : (isLive ? onPunchOut : onPunchIn),
+              icon: Icon(isLive ? Icons.logout_rounded : Icons.login_rounded),
+              label: Text(isLive ? 'Punch Out' : 'Punch In'),
               style: FilledButton.styleFrom(
                 backgroundColor: AppColors.secondary,
                 disabledBackgroundColor: AppColors.secondary.withValues(alpha: 0.4),
