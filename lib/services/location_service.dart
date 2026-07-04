@@ -316,17 +316,48 @@ class LocationService {
   /// Fetches a fresh GPS fix; retries if cached or low-accuracy.
   Future<Position> getFreshPosition() async {
     final settings = _locationSettings();
-    var position = await Geolocator.getCurrentPosition(
-      locationSettings: settings,
-    );
 
-    if (_isStale(position) || _isLowAccuracy(position)) {
+    Position? position;
+    try {
+      position = await Geolocator.getCurrentPosition(
+        locationSettings: settings,
+      ).timeout(const Duration(seconds: 25));
+    } catch (error) {
+      debugPrint('[GPS] getCurrentPosition failed: $error');
+    }
+
+    if (position != null &&
+        (_isStale(position) || _isLowAccuracy(position))) {
       debugPrint(
         '[GPS] Retrying — age=${DateTime.now().difference(position.timestamp).inSeconds}s '
         'accuracy=${position.accuracy.toStringAsFixed(1)}m',
       );
-      position = await Geolocator.getCurrentPosition(
-        locationSettings: settings,
+      try {
+        position = await Geolocator.getCurrentPosition(
+          locationSettings: settings,
+        ).timeout(const Duration(seconds: 25));
+      } catch (error) {
+        debugPrint('[GPS] Retry getCurrentPosition failed: $error');
+      }
+    }
+
+    if (position == null ||
+        !hasValidCoordinates(position.latitude, position.longitude)) {
+      try {
+        final lastKnown = await Geolocator.getLastKnownPosition();
+        if (lastKnown != null &&
+            hasValidCoordinates(lastKnown.latitude, lastKnown.longitude)) {
+          debugPrint('[GPS] Using last known position');
+          position = lastKnown;
+        }
+      } catch (error) {
+        debugPrint('[GPS] getLastKnownPosition failed: $error');
+      }
+    }
+
+    if (position == null) {
+      throw LocationException(
+        'GPS location not ready. Please wait for accurate location and try again.',
       );
     }
 

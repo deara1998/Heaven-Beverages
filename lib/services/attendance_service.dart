@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'package:heaven_beverages/models/track_point.dart';
+import 'package:heaven_beverages/services/location_service.dart';
 import 'package:intl/intl.dart';
 import 'package:xml/xml.dart';
 
@@ -288,6 +290,7 @@ class StaffDashboardResult {
     this.punchInTime,
     this.data,
     this.record,
+    this.dayTrackPoints = const [],
   });
 
   factory StaffDashboardResult.fromJson(Map<String, dynamic> json, String raw) {
@@ -321,6 +324,12 @@ class StaffDashboardResult {
       punchInTime: punchInTime,
       data: json,
       record: profile,
+      dayTrackPoints: extractDayTrackPoints(
+        resultBlock: resultBlock,
+        profile: profile,
+        sessions: sessions,
+        punchInTime: punchInTime,
+      ),
     );
   }
 
@@ -332,6 +341,7 @@ class StaffDashboardResult {
   final DateTime? punchInTime;
   final Map<String, dynamic>? data;
   final Map<String, dynamic>? record;
+  final List<TrackPoint> dayTrackPoints;
 
   /// True when last session is Live / open (no punch out).
   bool get isLive => isPunchedIn ?? todayStatus?.trim().toLowerCase() == 'live';
@@ -629,5 +639,315 @@ class StaffDashboardResult {
     final ms = int.tryParse(match.group(1)!);
     if (ms == null) return null;
     return DateTime.fromMillisecondsSinceEpoch(ms, isUtc: true);
+  }
+
+  /// Parses today's route from staff_dashboard `trackPoints` array.
+  static List<TrackPoint> extractDayTrackPoints({
+    dynamic resultBlock,
+    Map<String, dynamic>? profile,
+    List<Map<String, dynamic>> sessions = const [],
+    DateTime? punchInTime,
+  }) {
+    if (resultBlock is Map) {
+      final map = resultBlock is Map<String, dynamic>
+          ? resultBlock
+          : Map<String, dynamic>.from(resultBlock);
+
+      final trackPoints = _readTrackPointsArray(map);
+      if (trackPoints.isNotEmpty) {
+        return trackPoints;
+      }
+    }
+
+    return _extractLegacyTrackPoints(
+      resultBlock: resultBlock,
+      profile: profile,
+      sessions: sessions,
+      punchInTime: punchInTime,
+    );
+  }
+
+  static List<TrackPoint> _readTrackPointsArray(Map<String, dynamic> map) {
+    final raw = map['trackPoints'] ??
+        map['TrackPoints'] ??
+        map['track_points'] ??
+        map['Track_Points'];
+
+    if (raw is! List || raw.isEmpty) return const [];
+
+    final points = <TrackPoint>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final parsed = _parseTrackPoint(Map<String, dynamic>.from(item));
+      if (parsed != null) points.add(parsed);
+    }
+
+    points.sort((a, b) {
+      if (a.timestamp == null && b.timestamp == null) return 0;
+      if (a.timestamp == null) return 1;
+      if (b.timestamp == null) return -1;
+      return a.timestamp!.compareTo(b.timestamp!);
+    });
+
+    return points;
+  }
+
+  static TrackPoint? _parseTrackPoint(Map<String, dynamic> source) {
+    final latitude = _readCoordinate(source, const [
+      'Latitude',
+      'latitude',
+      'Lat',
+      'lat',
+    ]);
+    final longitude = _readCoordinate(source, const [
+      'Longitude',
+      'longitude',
+      'Lng',
+      'lng',
+    ]);
+
+    if (latitude == null || longitude == null) return null;
+    if (!LocationService.hasValidCoordinates(latitude, longitude)) return null;
+
+    final attendanceRaw = source['AttendanceId'] ??
+        source['attendance_id'] ??
+        source['attendanceId'];
+    final attendanceId = attendanceRaw is num
+        ? attendanceRaw.toInt()
+        : int.tryParse(attendanceRaw?.toString() ?? '');
+
+    final speedRaw = source['Speed'] ?? source['speed'];
+    final batteryRaw =
+        source['BatteryPercentage'] ?? source['battery_percentage'];
+
+    return TrackPoint(
+      latitude: latitude,
+      longitude: longitude,
+      timestamp: _readDateTime(source, const [
+        'PingTime',
+        'ping_time',
+        'LogTime',
+        'log_time',
+      ]),
+      attendanceId: attendanceId,
+      speed: _normalizeOptionalText(speedRaw),
+      batteryPercentage: _normalizeOptionalText(batteryRaw),
+    );
+  }
+
+  static String? _normalizeOptionalText(dynamic value) {
+    if (value == null) return null;
+    final text = value.toString().trim();
+    if (text.isEmpty || text == '-') return null;
+    return text;
+  }
+
+  static List<TrackPoint> _extractLegacyTrackPoints({
+    dynamic resultBlock,
+    Map<String, dynamic>? profile,
+    List<Map<String, dynamic>> sessions = const [],
+    DateTime? punchInTime,
+  }) {
+    final points = <TrackPoint>[];
+    final seen = <String>{};
+
+    void addPoint(
+      double latitude,
+      double longitude, {
+      DateTime? timestamp,
+    }) {
+      if (!LocationService.hasValidCoordinates(latitude, longitude)) return;
+      final point = TrackPoint(
+        latitude: latitude,
+        longitude: longitude,
+        timestamp: timestamp,
+      );
+      if (seen.contains(point.coordinateKey)) return;
+      seen.add(point.coordinateKey);
+      points.add(point);
+    }
+
+    void addFromMap(Map<String, dynamic> source) {
+      final latitude = _readCoordinate(source, const [
+        'latitude',
+        'Latitude',
+        'lat',
+        'Lat',
+        'CurrentPunchInLat',
+        'PunchInLat',
+        'punch_in_lat',
+        'LastLat',
+        'LastPingLat',
+        'last_lat',
+      ]);
+      final longitude = _readCoordinate(source, const [
+        'longitude',
+        'Longitude',
+        'lng',
+        'Lng',
+        'long',
+        'Long',
+        'CurrentPunchInLng',
+        'PunchInLng',
+        'punch_in_lng',
+        'LastLng',
+        'LastPingLng',
+        'last_lng',
+      ]);
+      if (latitude == null || longitude == null) return;
+
+      addPoint(
+        latitude,
+        longitude,
+        timestamp: _readDateTime(source, const [
+          'LogTime',
+          'log_time',
+          'TrackTime',
+          'track_time',
+          'CreatedOn',
+          'created_on',
+          'PingTime',
+          'ping_time',
+          'LastPingTime',
+          'last_ping_time',
+          'PunchInTime',
+          'punch_in_time',
+        ]),
+      );
+    }
+
+    void parseTrackList(dynamic value) {
+      if (value is! List) return;
+      for (final item in value) {
+        if (item is Map<String, dynamic>) {
+          addFromMap(item);
+        } else if (item is Map) {
+          addFromMap(Map<String, dynamic>.from(item));
+        }
+      }
+    }
+
+    const arrayKeys = [
+      'track_logs',
+      'trackLogs',
+      'TrackLogs',
+      'track_list',
+      'TrackList',
+      'locations',
+      'Locations',
+      'location_logs',
+      'LocationLogs',
+      'trip_locations',
+      'TripLocations',
+      'gps_logs',
+      'GpsLogs',
+      'route_points',
+      'RoutePoints',
+      'points',
+      'Points',
+      'tracks',
+      'Tracks',
+      'tracking',
+      'Tracking',
+    ];
+
+    if (profile != null) {
+      addFromMap(profile);
+      for (final key in arrayKeys) {
+        parseTrackList(profile[key]);
+      }
+    }
+
+    if (resultBlock is Map) {
+      final map = resultBlock is Map<String, dynamic>
+          ? resultBlock
+          : Map<String, dynamic>.from(resultBlock);
+      for (final key in arrayKeys) {
+        parseTrackList(map[key]);
+      }
+    }
+
+    for (final session in sessions) {
+      addFromMap(session);
+      for (final key in arrayKeys) {
+        parseTrackList(session[key]);
+      }
+
+      final punchInLat = _readCoordinate(session, const [
+        'PunchInLat',
+        'punch_in_lat',
+      ]);
+      final punchInLng = _readCoordinate(session, const [
+        'PunchInLng',
+        'punch_in_lng',
+      ]);
+      if (punchInLat != null && punchInLng != null) {
+        addPoint(
+          punchInLat,
+          punchInLng,
+          timestamp: _readDateTime(session, const [
+            'PunchInTime',
+            'punch_in_time',
+          ]),
+        );
+      }
+
+      final punchOutLat = _readCoordinate(session, const [
+        'PunchOutLat',
+        'punch_out_lat',
+      ]);
+      final punchOutLng = _readCoordinate(session, const [
+        'PunchOutLng',
+        'punch_out_lng',
+      ]);
+      if (punchOutLat != null && punchOutLng != null) {
+        addPoint(
+          punchOutLat,
+          punchOutLng,
+          timestamp: _readDateTime(session, const [
+            'PunchOutTime',
+            'punch_out_time',
+          ]),
+        );
+      }
+    }
+
+    if (profile != null) {
+      final punchInLat = _readCoordinate(profile, const [
+        'CurrentPunchInLat',
+        'current_punch_in_lat',
+      ]);
+      final punchInLng = _readCoordinate(profile, const [
+        'CurrentPunchInLng',
+        'current_punch_in_lng',
+      ]);
+      if (punchInLat != null && punchInLng != null) {
+        addPoint(punchInLat, punchInLng, timestamp: punchInTime);
+      }
+    }
+
+    points.sort((a, b) {
+      if (a.timestamp == null && b.timestamp == null) return 0;
+      if (a.timestamp == null) return 1;
+      if (b.timestamp == null) return -1;
+      return a.timestamp!.compareTo(b.timestamp!);
+    });
+
+    return points;
+  }
+
+  static double? _readCoordinate(
+    Map<String, dynamic>? source,
+    List<String> keys,
+  ) {
+    if (source == null) return null;
+    for (final key in keys) {
+      final value = source[key];
+      if (value == null) continue;
+      if (value is num) return value.toDouble();
+      final parsed = double.tryParse(value.toString().trim());
+      if (parsed != null) return parsed;
+    }
+    return null;
   }
 }

@@ -21,6 +21,9 @@
         <meta-data
             android:name="com.google.android.geo.API_KEY"
             android:value="AIzaSyBJfj26H8Lrz3i5D2ruSbJWORSw30cVKIE"/>
+        <meta-data
+            android:name="io.flutter.embedded_views_preview"
+            android:value="true"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -45,23 +48,15 @@
 
         <service
             android:name="id.flutter.flutter_background_service.BackgroundService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="location"
-            android:stopWithTask="true"
-            tools:replace="android:exported,android:foregroundServiceType,android:stopWithTask" />
+            tools:node="remove" />
 
         <receiver
             android:name="id.flutter.flutter_background_service.WatchdogReceiver"
-            android:enabled="false"
-            android:exported="false"
-            tools:replace="android:exported,android:enabled" />
+            tools:node="remove" />
 
         <receiver
             android:name="id.flutter.flutter_background_service.BootReceiver"
-            android:enabled="false"
-            android:exported="false"
-            tools:replace="android:exported,android:enabled" />
+            tools:node="remove" />
     </application>
     <queries>
         <intent>

@@ -2,19 +2,20 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:heaven_beverages/models/attendance_log_entry.dart';
+import 'package:heaven_beverages/models/track_point.dart';
 import 'package:heaven_beverages/models/user_session.dart';
 import 'package:heaven_beverages/pages/login_page.dart';
 import 'package:heaven_beverages/services/api_client.dart';
-import 'package:heaven_beverages/services/app_startup.dart';
 import 'package:heaven_beverages/services/attendance_service.dart';
-import 'package:heaven_beverages/services/background_tracking_service.dart';
 import 'package:heaven_beverages/services/location_service.dart';
 import 'package:heaven_beverages/services/session_manager.dart';
 import 'package:heaven_beverages/services/session_storage.dart';
 import 'package:heaven_beverages/services/tracking_constants.dart';
 import 'package:heaven_beverages/services/tracking_permissions.dart';
 import 'package:heaven_beverages/theme/app_theme.dart';
+import 'package:heaven_beverages/widgets/attendance_route_map.dart';
 import 'package:intl/intl.dart';
 
 class DashboardPage extends StatefulWidget {
@@ -40,8 +41,8 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   DateTime? _punchInTime;
   LocationSnapshot? _currentLocation;
   final List<AttendanceLogEntry> _activityLog = [];
-  StreamSubscription<Map<String, dynamic>?>? _syncSubscription;
-  StreamSubscription<Map<String, dynamic>?>? _locationSubscription;
+  List<TrackPoint> _dayRoutePoints = [];
+  final List<TrackPoint> _liveRoutePoints = [];
   bool _isSendingTrackLog = false;
   bool _foregroundTrackingActive = false;
 
@@ -54,19 +55,6 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     });
   }
 
-  Future<void> _attachBackgroundListeners() async {
-    if (kIsWeb) return;
-    try {
-      _syncSubscription =
-          BackgroundTrackingService.syncUpdates().listen(_handleBackgroundSync);
-      _locationSubscription = BackgroundTrackingService.locationUpdates()
-          .listen(_handleLocationUpdate);
-    } catch (error, stackTrace) {
-      debugPrint('[Dashboard] Background listeners failed: $error');
-      debugPrint('$stackTrace');
-    }
-  }
-
   Future<void> _safeStartup() async {
     try {
       await _loadStaffDashboard();
@@ -76,13 +64,10 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       }
 
       if (await TrackingPermissions.hasForegroundLocation()) {
-        await _refreshLocation(showLoader: false);
-      }
-
-      if (!kIsWeb &&
-          _isPunchedIn &&
-          await TrackingPermissions.canUseBackgroundService()) {
-        await _attachBackgroundListeners();
+        Future<void>.delayed(const Duration(seconds: 3), () {
+          if (!mounted) return;
+          unawaited(_refreshLocation(showLoader: false));
+        });
       }
     } catch (error, stackTrace) {
       debugPrint('[Dashboard] startup failed: $error');
@@ -95,9 +80,9 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   }
 
   void _scheduleForegroundTracking() {
-    Future<void>.delayed(const Duration(seconds: 2), () {
+    Future<void>.delayed(const Duration(seconds: 5), () {
       if (!mounted || !_isPunchedIn) return;
-      unawaited(_startTracking(preferBackground: false));
+      unawaited(_startTracking());
     });
   }
 
@@ -132,6 +117,10 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
 
       if (!mounted) return;
       setState(() => _todayStatus = dashboard.todayStatus);
+
+      if (mounted) {
+        _mergeApiRoutePoints(dashboard.dayTrackPoints);
+      }
 
       await _applyAttendanceState(
         isPunchedIn: isOnDuty,
@@ -238,8 +227,6 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _syncSubscription?.cancel();
-    _locationSubscription?.cancel();
     _locationService.dispose();
     _attendanceService.dispose();
     _sessionManager.dispose();
@@ -265,111 +252,23 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     );
   }
 
-  void _handleLocationUpdate(Map<String, dynamic>? event) {
-    if (!mounted || event == null) return;
-
-    final latitude = event['latitude'];
-    final longitude = event['longitude'];
-    if (latitude is! num || longitude is! num) return;
-
-    setState(() {
-      _currentLocation = LocationSnapshot(
-        latitude: latitude.toDouble(),
-        longitude: longitude.toDouble(),
-        speedKmh: event['speedKmh']?.toString() ?? '0',
-        batteryPercentage: event['batteryPercentage']?.toString() ?? '0',
-      );
-    });
-  }
-
-  void _handleBackgroundSync(Map<String, dynamic>? event) {
-    if (!mounted || event == null) return;
-
-    final latitude = event['latitude'];
-    final longitude = event['longitude'];
-    if (latitude is num && longitude is num) {
-      final snapshot = LocationSnapshot(
-        latitude: latitude.toDouble(),
-        longitude: longitude.toDouble(),
-        speedKmh: event['speedKmh']?.toString() ?? '0',
-        batteryPercentage: event['batteryPercentage']?.toString() ?? '0',
-      );
-      setState(() {
-        _currentLocation = snapshot;
-      });
-      _addLog(
-        action: (event['success'] as bool? ?? false) ? 'Track Log' : 'Track Log Failed',
-        snapshot: snapshot,
-        message: event['message']?.toString(),
-        success: event['success'] as bool? ?? false,
-      );
-    } else if (event['message'] != null) {
-      _addLog(
-        action: 'Track Log Failed',
-        snapshot: _currentLocation ??
-            const LocationSnapshot(
-              latitude: 0,
-              longitude: 0,
-              speedKmh: '0',
-              batteryPercentage: '0',
-            ),
-        message: event['message'].toString(),
-        success: false,
-      );
-    }
-  }
-
   Future<void> _refreshDashboard() async {
     await _loadStaffDashboard();
     await _refreshLocation(showLoader: false);
   }
 
-  Future<void> _startTracking({bool preferBackground = false}) async {
-    if (!_isPunchedIn) return;
+  Future<void> _startTracking() async {
+    if (!_isPunchedIn || _foregroundTrackingActive) return;
 
     try {
-      final canUseBackground = !kIsWeb &&
-          preferBackground &&
-          await TrackingPermissions.canUseBackgroundService();
-
-      if (canUseBackground) {
-        _locationService.stopPeriodicTracking();
-        _foregroundTrackingActive = false;
-        await _ensurePersistentTracking();
+      if (!await TrackingPermissions.hasForegroundLocation()) {
+        debugPrint('[Tracking] Foreground location not granted — loop not started');
         return;
-      }
-
-      if (!kIsWeb) {
-        await BackgroundTrackingService.stop();
       }
       _startForegroundTrackingLoop();
     } catch (error, stackTrace) {
       debugPrint('[Tracking] _startTracking failed: $error');
       debugPrint('$stackTrace');
-    }
-  }
-
-  Future<void> _ensurePersistentTracking() async {
-    if (kIsWeb || !_isPunchedIn) return;
-    if (!await TrackingPermissions.canUseBackgroundService()) {
-      debugPrint('[Tracking] Background service skipped — need "Allow all the time"');
-      return;
-    }
-
-    try {
-      await AppStartup.ensureBackgroundTrackingReady();
-
-      final started = await BackgroundTrackingService.ensureRunning(
-        widget.session.userId,
-      );
-      if (!started) {
-        debugPrint('[Tracking] Background service not started — using foreground loop');
-        _startForegroundTrackingLoop();
-      }
-    } catch (error, stackTrace) {
-      debugPrint('[Tracking] ensurePersistentTracking failed: $error');
-      debugPrint('$stackTrace');
-      _startForegroundTrackingLoop();
     }
   }
 
@@ -420,7 +319,14 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       }
     }
 
-    LocationService.ensureValidCoordinates(resolved.latitude, resolved.longitude);
+    if (!LocationService.hasValidCoordinates(
+      resolved.latitude,
+      resolved.longitude,
+    )) {
+      debugPrint('[Tracking] Skipping track_log — invalid GPS coordinates');
+      return;
+    }
+
     final batteryPercentage = await _locationService.readBatteryPercentage();
     final coords = LocationService.coordinatesForApi(
       resolved.latitude,
@@ -469,6 +375,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         batteryPercentage: battery,
         syncTime: syncTime,
       );
+      _appendLiveRoutePoint(
+        latitude: enrichedSnapshot.latitude,
+        longitude: enrichedSnapshot.longitude,
+        timestamp: syncTime,
+        speed: enrichedSnapshot.speedKmh,
+        batteryPercentage: battery,
+      );
     }
     _addLog(
       action: 'Track Log',
@@ -481,9 +394,6 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
   Future<void> _stopTracking() async {
     _locationService.stopPeriodicTracking();
     _foregroundTrackingActive = false;
-    if (!kIsWeb) {
-      await BackgroundTrackingService.stop();
-    }
   }
 
   Future<void> _sendTrackLogFromForeground(LocationSnapshot snapshot) async {
@@ -504,6 +414,88 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
     } finally {
       _isSendingTrackLog = false;
     }
+  }
+
+  /// Adds API [trackPoints] without removing pins already loaded today.
+  void _mergeApiRoutePoints(List<TrackPoint> incoming) {
+    if (incoming.isEmpty) return;
+
+    final merged = [..._dayRoutePoints];
+    final seen = merged.map((point) => point.uniqueKey).toSet();
+    var added = false;
+
+    for (final point in incoming) {
+      if (seen.add(point.uniqueKey)) {
+        merged.add(point);
+        added = true;
+      }
+    }
+
+    if (!added) return;
+
+    merged.sort(_sortTrackPoints);
+    setState(() => _dayRoutePoints = merged);
+  }
+
+  int _sortTrackPoints(TrackPoint a, TrackPoint b) {
+    if (a.timestamp == null && b.timestamp == null) return 0;
+    if (a.timestamp == null) return 1;
+    if (b.timestamp == null) return -1;
+    return a.timestamp!.compareTo(b.timestamp!);
+  }
+
+  void _appendLiveRoutePoint({
+    required double latitude,
+    required double longitude,
+    required DateTime timestamp,
+    String? speed,
+    String? batteryPercentage,
+    int? attendanceId,
+  }) {
+    if (!LocationService.hasValidCoordinates(latitude, longitude)) return;
+
+    final point = TrackPoint(
+      latitude: latitude,
+      longitude: longitude,
+      timestamp: timestamp,
+      speed: speed,
+      batteryPercentage: batteryPercentage,
+      attendanceId: attendanceId,
+    );
+
+    final alreadyShown = _dayRoutePoints.any(
+          (item) => item.uniqueKey == point.uniqueKey,
+        ) ||
+        _liveRoutePoints.any((item) => item.uniqueKey == point.uniqueKey);
+    if (alreadyShown) return;
+
+    setState(() => _liveRoutePoints.add(point));
+  }
+
+  List<TrackPoint> _mapRoutePoints() {
+    final merged = [..._dayRoutePoints];
+    final seen = merged.map((point) => point.uniqueKey).toSet();
+
+    for (final point in _liveRoutePoints) {
+      if (seen.add(point.uniqueKey)) {
+        merged.add(point);
+      }
+    }
+
+    merged.sort(_sortTrackPoints);
+    return merged;
+  }
+
+  LatLng? _currentMapLocation() {
+    final location = _currentLocation;
+    if (location == null) return null;
+    if (!LocationService.hasValidCoordinates(
+      location.latitude,
+      location.longitude,
+    )) {
+      return null;
+    }
+    return LatLng(location.latitude, location.longitude);
   }
 
   Future<void> _refreshLocation({bool showLoader = true}) async {
@@ -575,25 +567,37 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         _currentLocation = snapshot;
       });
 
+      _appendLiveRoutePoint(
+        latitude: snapshot.latitude,
+        longitude: snapshot.longitude,
+        timestamp: punchInTime,
+        speed: snapshot.speedKmh,
+        batteryPercentage: snapshot.batteryPercentage,
+      );
+
       _addLog(
         action: 'Punch In',
         snapshot: snapshot,
         message: result.message ?? 'Punched in successfully',
       );
 
-      await _submitTrackLog(snapshot, force: true);
+      try {
+        await _submitTrackLog(snapshot, force: true);
+      } catch (error, stackTrace) {
+        debugPrint('[PunchIn] Initial track_log failed: $error');
+        debugPrint('$stackTrace');
+      }
 
-      await _startTracking(preferBackground: false);
+      try {
+        await _startTracking();
+      } catch (error, stackTrace) {
+        debugPrint('[PunchIn] Tracking loop failed to start: $error');
+        debugPrint('$stackTrace');
+      }
+
       unawaited(_loadStaffDashboard());
 
-      if (!kIsWeb && !await TrackingPermissions.canUseBackgroundService()) {
-        _showMessage(
-          'Punch in successful. Tracking works while the app is open. '
-          'For background tracking, set Location to "Allow all the time" in settings.',
-        );
-      } else {
-        _showMessage(result.message ?? 'Punch in successful');
-      }
+      _showMessage(result.message ?? 'Punch in successful');
     } on AttendanceException catch (error) {
       _showMessage(error.message, isError: true);
     } on LocationException catch (error) {
@@ -630,6 +634,7 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         throw AttendanceException(result.message ?? result.raw);
       }
 
+      final punchOutTime = DateTime.now();
       await _sessionStorage.clearPunchIn();
 
       if (!mounted) return;
@@ -640,6 +645,14 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
         _currentLocation = snapshot;
       });
 
+      _appendLiveRoutePoint(
+        latitude: snapshot.latitude,
+        longitude: snapshot.longitude,
+        timestamp: punchOutTime,
+        speed: snapshot.speedKmh,
+        batteryPercentage: snapshot.batteryPercentage,
+      );
+
       _addLog(
         action: 'Punch Out',
         snapshot: snapshot,
@@ -649,13 +662,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
       unawaited(_loadStaffDashboard());
       _showMessage(result.message ?? 'Punch out successful');
     } on AttendanceException catch (error) {
-      if (_isPunchedIn) await _startTracking(preferBackground: false);
+      if (_isPunchedIn) unawaited(_startTracking());
       _showMessage(error.message, isError: true);
     } on LocationException catch (error) {
-      if (_isPunchedIn) await _startTracking(preferBackground: false);
+      if (_isPunchedIn) unawaited(_startTracking());
       _showMessage(error.message, isError: true);
     } catch (error) {
-      if (_isPunchedIn) await _startTracking(preferBackground: false);
+      if (_isPunchedIn) unawaited(_startTracking());
       _showMessage(_connectionErrorMessage(error), isError: true);
     } finally {
       if (mounted) setState(() => _isBusy = false);
@@ -826,6 +839,13 @@ class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserv
                     trackCount: _successfulTrackCount(),
                     onDuty: _isPunchedIn ? 1 : 0,
                     failedCount: _failedTrackCount(),
+                  ),
+                  const SizedBox(height: 22),
+                  AttendanceRouteMap(
+                    routePoints: _mapRoutePoints(),
+                    currentLocation: _currentMapLocation(),
+                    isLive: _isLiveForUi(),
+                    height: 300,
                   ),
                   const SizedBox(height: 22),
                   _SectionTitle(
